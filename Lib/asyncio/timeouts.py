@@ -1,5 +1,8 @@
 import contextlib
+import dataclasses
 import enum
+import functools
+import heapq
 
 from types import TracebackType
 from typing import final, Any, Iterator, Optional, Type
@@ -35,6 +38,7 @@ class CancelScope:
     ) -> None:
         self._loop = loop
         self._state = _State.CREATED
+        self._ref = None
 
         self._timeout_handler: Optional[events.TimerHandle] = None
         self._task: Optional[tasks.Task[Any]] = None
@@ -59,6 +63,10 @@ class CancelScope:
     def cancelling(self) -> bool:
         # Timeout reached, cancellation scheduled
         return self._state in (_State.CANCELLING, _State.CANCELLED)
+
+    def done(self) -> bool:
+        # Timeout reached, cancellation scheduled
+        return self._state != _State.ENTERED
 
     def __repr__(self) -> str:
         info = [str(self._state)]
@@ -122,6 +130,74 @@ class CancelScope:
         self._state = _State.CANCELLING
         # drop the reference early
         self._timeout_handler = None
+
+
+@functools.total_ordering
+@dataclasses.dataclass
+class _ScopeRef:
+    # a reference to scope that can be used as a heap element
+
+    scope: Optional[CancelScope]
+    deadline: float = dataclasses.field(init=False)
+
+    def __post_init__(self) -> None:
+        assert self.scope is not None
+        self.deadline = self.scope.deadlinex
+
+    def __eq__(self, other):
+        if isinstance(other, _ScopeRef):
+            return (
+                self.deadline == other.deadline and
+                id(self.scope) == id(other.scope)
+            )
+        return NotImplemented
+
+    def __hash__(self):
+        return hash(self.deadline)
+
+    def __lt__(self, other):
+        if isinstance(other, _ScopeRef):
+            return self.deadline < other.deadline
+        return NotImplemented
+
+
+@dataclasses.dataclass
+class _TaskStore:
+    task: tasks.Task[Any]
+    timeout_handler: Optional[events.TimerHandle] = None
+    scope_refs: list[_ScopeRef] = dataclasses.field(defautl_factory=list)
+
+    def __post_init__(self) -> None:
+        self.task.add_done_callback(_cleanup_store)
+
+    def reschedule(self, scope: CancelScope) -> None:
+        if scope._ref is not None:
+            scope._ref.scope = None  # convert heapq item to 'zombie'
+        if scope._deadline is None:
+            # scope without deadline is not set
+            scope._ref = None
+        else:
+            ref = _ScopeRef(scope)
+            heapq.heappush(self.scope_refs, ref)
+
+
+_Store: dict[tasks.Task[Any], _TaskStore] = {}
+
+
+def _cleanup_store(task: tasks.Task[Any]) -> None:
+    task_store = _Store.pop(task)
+    if __debug__:
+        unfinished = [
+            scope_ref.scope
+            for scope_ref in task_store.scope_refs
+            if scope_ref is not None and not scope_ref.scope.done()
+        ]
+        if unfinished:
+            loop = events.get_running_loop()
+            loop.call_exception_handler({
+                "message": f"Task {task!r} has unfinished scopes {unfinished}",
+                "task": task,
+            })
 
 
 @contextlib.contextmanager
