@@ -1738,6 +1738,13 @@ Special read-only attributes
      - The :term:`generator` or :term:`coroutine` object that owns this frame,
        or ``None`` if the frame is a normal function.
 
+       .. impl-detail::
+
+          A coroutine that is awaited as soon as it is called
+          (``await coro_func()``) may be run without creating a coroutine
+          object until it first suspends; until then this attribute is
+          ``None``.
+
        .. versionadded:: 3.14
 
 .. index::

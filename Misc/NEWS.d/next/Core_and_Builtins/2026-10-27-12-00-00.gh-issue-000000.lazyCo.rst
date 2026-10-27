@@ -1,0 +1,3 @@
+A coroutine that is awaited as soon as it is called (``await coro_func()``)
+now runs without creating a coroutine object unless it suspends, making
+awaits that complete immediately about 40% faster.

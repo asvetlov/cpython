@@ -1853,9 +1853,23 @@ dummy_func(
             // NOTE: It's important that YIELD_VALUE never raises an exception!
             // The compiler treats any exception raised here as a failed close()
             // or throw() call.
+            // The one exception is a lazily created coroutine (see
+            // RETURN_GENERATOR) that cannot be allocated: the await is
+            // then treated as having raised MemoryError.
             assert(frame->owner != FRAME_OWNED_BY_INTERPRETER);
+            PyGenObject *gen;
+            int lazy = frame->owner == FRAME_OWNED_BY_THREAD;
+            if (lazy) {
+                gen = (PyGenObject *)_PyCoro_MaterializeLazy(frame);
+                if (gen == NULL) {
+                    ERROR_NO_POP();
+                }
+                gen->gi_exc_state.previous_item = tstate->exc_info;
+            }
+            else {
+                gen = _PyGen_GetGeneratorFromFrame(frame);
+            }
             frame->instr_ptr++;
-            PyGenObject *gen = _PyGen_GetGeneratorFromFrame(frame);
             assert(FRAME_SUSPENDED_YIELD_FROM == FRAME_SUSPENDED + 1);
             assert(oparg == 0 || oparg == 1);
             _PyStackRef temp = retval;
@@ -1868,6 +1882,9 @@ dummy_func(
             _PyInterpreterFrame *gen_frame = frame;
             _PyThreadState_UpdateLastProfiledFrame(tstate, gen_frame, gen_frame->previous);
             frame = tstate->current_frame = frame->previous;
+            if (lazy) {
+                gen_frame = _PyEval_MoveLazyCoroFrame(tstate, gen, gen_frame);
+            }
             gen_frame->previous = NULL;
             ((_PyThreadStateImpl *)tstate)->generator_return_kind = GENERATOR_YIELD;
             FT_ATOMIC_STORE_INT8_RELEASE(gen->gi_frame_state, FRAME_SUSPENDED + oparg);
@@ -1883,6 +1900,12 @@ dummy_func(
             #endif
             RELOAD_STACK();
             LOAD_IP(1 + INLINE_CACHE_ENTRIES_SEND);
+            if (lazy) {
+                /* Fill in the coroutine slot of the caller's SEND. */
+                assert(PyStackRef_IsNone(stack_pointer[-2]));
+                assert(PyStackRef_IsNull(stack_pointer[-1]));
+                stack_pointer[-2] = PyStackRef_FromPyObjectStealMortal((PyObject *)gen);
+            }
             value = temp;
             LLTRACE_RESUME_FRAME();
         }
@@ -5806,25 +5829,54 @@ dummy_func(
         inst(RETURN_GENERATOR, (-- res)) {
             assert(PyStackRef_FunctionCheck(frame->f_funcobj));
             PyFunctionObject *func = (PyFunctionObject *)PyStackRef_AsPyObjectBorrow(frame->f_funcobj);
-            PyGenObject *gen = (PyGenObject *)_Py_MakeCoro(func);
-            ERROR_IF(gen == NULL);
-            assert(STACK_LEVEL() <= 2);
-            SAVE_STACK();
-            _PyInterpreterFrame *gen_frame = &gen->gi_iframe;
-            frame->instr_ptr++;
-            _PyFrame_Copy(frame, gen_frame);
-            assert(frame->frame_obj == NULL);
-            gen->gi_frame_state = FRAME_CREATED;
-            gen_frame->owner = FRAME_OWNED_BY_GENERATOR;
-            _Py_LeaveRecursiveCallPy(tstate);
-            _PyInterpreterFrame *prev = frame->previous;
-            _PyThreadState_UpdateLastProfiledFrame(tstate, frame, prev);
-            _PyThreadState_PopFrame(tstate, frame);
-            frame = tstate->current_frame = prev;
-            LOAD_IP(frame->return_offset);
-            RELOAD_STACK();
-            res = PyStackRef_FromPyObjectStealMortal((PyObject *)gen);
-            LLTRACE_RESUME_FRAME();
+            #if TIER_ONE
+            _Py_CODEUNIT *send = _PyEval_LazyCoroSendInstr(frame, func);
+            #else
+            _Py_CODEUNIT *send = NULL;
+            #endif
+            if (send != NULL) {
+                /* The caller is going to await the coroutine right away.
+                 * Keep executing its body in this frame, and only create
+                 * the coroutine object if the body suspends (see
+                 * _YIELD_VALUE). Set up the caller's frame as if SEND_GEN
+                 * had pushed this frame: `[receiver, NULL]` on its stack,
+                 * with the coroutine slot filled in on materialization,
+                 * and its instruction pointer at the SEND. */
+                _PyInterpreterFrame *prev = frame->previous;
+                /* The caller's exception context is needed to split
+                 * the exception state on materialization. f_locals is
+                 * unused for optimized code, so stash it there. */
+                assert(frame->f_locals == NULL);
+                frame->f_locals = Py_XNewRef(tstate->exc_info->exc_value);
+                _PyFrame_StackPush(prev, PyStackRef_None);
+                _PyFrame_StackPush(prev, PyStackRef_NULL);
+                prev->instr_ptr = send;
+                assert(1 + INLINE_CACHE_ENTRIES_SEND + send->op.arg <= UINT16_MAX);
+                prev->return_offset = (uint16_t)(1 + INLINE_CACHE_ENTRIES_SEND + send->op.arg);
+                /* The following POP_TOP discards this. */
+                res = PyStackRef_None;
+            }
+            else {
+                PyGenObject *gen = (PyGenObject *)_Py_MakeCoro(func);
+                ERROR_IF(gen == NULL);
+                assert(STACK_LEVEL() <= 2);
+                SAVE_STACK();
+                _PyInterpreterFrame *gen_frame = &gen->gi_iframe;
+                frame->instr_ptr++;
+                _PyFrame_Copy(frame, gen_frame);
+                assert(frame->frame_obj == NULL);
+                gen->gi_frame_state = FRAME_CREATED;
+                gen_frame->owner = FRAME_OWNED_BY_GENERATOR;
+                _Py_LeaveRecursiveCallPy(tstate);
+                _PyInterpreterFrame *prev = frame->previous;
+                _PyThreadState_UpdateLastProfiledFrame(tstate, frame, prev);
+                _PyThreadState_PopFrame(tstate, frame);
+                frame = tstate->current_frame = prev;
+                LOAD_IP(frame->return_offset);
+                RELOAD_STACK();
+                res = PyStackRef_FromPyObjectStealMortal((PyObject *)gen);
+                LLTRACE_RESUME_FRAME();
+            }
         }
 
         inst(BUILD_SLICE, (args[oparg] -- slice)) {

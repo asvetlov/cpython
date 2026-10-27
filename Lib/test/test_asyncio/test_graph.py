@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import io
 import sys
 import unittest
@@ -18,17 +19,21 @@ def capture_test_stack(*, fut=None, depth=1):
                 if isinstance(s.future, asyncio.Task) else 'F'
         ]
 
+        def tag(frame):
+            # A coroutine awaited right after it is called may run
+            # without a coroutine object until it first suspends, so
+            # classify frames by their code rather than f_generator.
+            flags = frame.f_code.co_flags
+            if flags & inspect.CO_COROUTINE:
+                return "a"
+            if flags & inspect.CO_ASYNC_GENERATOR:
+                return "ag"
+            return "s"
+
         ret.append(
             [
-                (
-                    f"s {entry.frame.f_code.co_name}"
-                        if entry.frame.f_generator is None else
-                        (
-                            f"a {entry.frame.f_generator.cr_code.co_name}"
-                            if hasattr(entry.frame.f_generator, 'cr_code') else
-                            f"ag {entry.frame.f_generator.ag_code.co_name}"
-                        )
-                ) for entry in s.call_stack
+                f"{tag(entry.frame)} {entry.frame.f_code.co_name}"
+                for entry in s.call_stack
             ]
         )
 

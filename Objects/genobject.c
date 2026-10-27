@@ -1127,6 +1127,30 @@ make_gen(PyTypeObject *type, PyFunctionObject *func)
     return (PyObject *)gen;
 }
 
+static PyObject *
+make_coro(PyFunctionObject *func, _PyInterpreterFrame *caller)
+{
+    PyObject *coro = make_gen(&PyCoro_Type, func);
+    if (!coro) {
+        return NULL;
+    }
+    PyThreadState *tstate = _PyThreadState_GET();
+    int origin_depth = tstate->coroutine_origin_tracking_depth;
+
+    if (origin_depth == 0) {
+        ((PyCoroObject *)coro)->cr_origin_or_finalizer = NULL;
+    } else {
+        _PyInterpreterFrame *frame = _PyFrame_GetFirstComplete(caller);
+        PyObject *cr_origin = _PyCoro_ComputeOrigin(origin_depth, frame);
+        ((PyCoroObject *)coro)->cr_origin_or_finalizer = cr_origin;
+        if (!cr_origin) {
+            Py_DECREF(coro);
+            return NULL;
+        }
+    }
+    return coro;
+}
+
 PyObject *
 _Py_MakeCoro(PyFunctionObject *func)
 {
@@ -1150,28 +1174,28 @@ _Py_MakeCoro(PyFunctionObject *func)
     }
 
     assert (coro_flags == CO_COROUTINE);
-    PyObject *coro = make_gen(&PyCoro_Type, func);
-    if (!coro) {
-        return NULL;
-    }
     PyThreadState *tstate = _PyThreadState_GET();
-    int origin_depth = tstate->coroutine_origin_tracking_depth;
+    _PyInterpreterFrame *frame = tstate->current_frame;
+    assert(frame);
+    assert(_PyFrame_IsIncomplete(frame));
+    return make_coro(func, frame->previous);
+}
 
-    if (origin_depth == 0) {
-        ((PyCoroObject *)coro)->cr_origin_or_finalizer = NULL;
-    } else {
-        _PyInterpreterFrame *frame = tstate->current_frame;
-        assert(frame);
-        assert(_PyFrame_IsIncomplete(frame));
-        frame = _PyFrame_GetFirstComplete(frame->previous);
-        PyObject *cr_origin = _PyCoro_ComputeOrigin(origin_depth, frame);
-        ((PyCoroObject *)coro)->cr_origin_or_finalizer = cr_origin;
-        if (!cr_origin) {
-            Py_DECREF(coro);
-            return NULL;
-        }
-    }
-    return coro;
+/* Create the coroutine object for a coroutine whose body has been
+ * executing directly in `frame`, a frame owned by the thread, because
+ * its caller awaited the result immediately (see RETURN_GENERATOR in
+ * bytecodes.c).  Called when the body suspends for the first time.
+ * The frame itself is moved into the coroutine by the caller. */
+PyObject *
+_PyCoro_MaterializeLazy(_PyInterpreterFrame *frame)
+{
+    assert(frame->owner == FRAME_OWNED_BY_THREAD);
+    assert(PyStackRef_FunctionCheck(frame->f_funcobj));
+    PyFunctionObject *func =
+        (PyFunctionObject *)PyStackRef_AsPyObjectBorrow(frame->f_funcobj);
+    assert((((PyCodeObject *)func->func_code)->co_flags &
+            (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)) == CO_COROUTINE);
+    return make_coro(func, frame->previous);
 }
 
 static PyObject *

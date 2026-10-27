@@ -3750,6 +3750,71 @@ _PyEval_LoadGlobalStackRef(PyObject *globals, PyObject *builtins, PyObject *name
     }
 }
 
+/* RETURN_GENERATOR support for coroutines that are awaited immediately.
+ *
+ * If `frame` is a coroutine frame and its caller's next instructions are
+ * the await sequence `GET_AWAITABLE; PUSH_NULL; LOAD_COMMON_CONSTANT None; SEND`,
+ * return the SEND instruction, otherwise NULL. Instrumented or
+ * EXTENDED_ARG-prefixed instructions don't match, so the regular path
+ * is taken for them. */
+_Py_CODEUNIT *
+_PyEval_LazyCoroSendInstr(_PyInterpreterFrame *frame, PyFunctionObject *func)
+{
+    int flags = ((PyCodeObject *)func->func_code)->co_flags;
+    if ((flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR | CO_OPTIMIZED))
+        != (CO_COROUTINE | CO_OPTIMIZED))
+    {
+        return NULL;
+    }
+    _PyInterpreterFrame *prev = frame->previous;
+    if (prev->owner >= FRAME_OWNED_BY_INTERPRETER) {
+        /* Called from C: the caller can't be inspected. */
+        return NULL;
+    }
+    _Py_CODEUNIT *instr = prev->instr_ptr + prev->return_offset;
+    if (_PyOpcode_Deopt[instr[0].op.code] != GET_AWAITABLE ||
+        _PyOpcode_Deopt[instr[1].op.code] != PUSH_NULL ||
+        _PyOpcode_Deopt[instr[2].op.code] != LOAD_COMMON_CONSTANT ||
+        _PyOpcode_Deopt[instr[3].op.code] != SEND)
+    {
+        return NULL;
+    }
+    return &instr[3];
+}
+
+/* YIELD_VALUE support: move the frame of a lazily created coroutine
+ * from the thread's data stack into `gen`, and split the exception
+ * state the body shared with its caller. Returns the new frame. */
+_PyInterpreterFrame *
+_PyEval_MoveLazyCoroFrame(PyThreadState *tstate, PyGenObject *gen,
+                          _PyInterpreterFrame *frame)
+{
+    assert(frame->owner == FRAME_OWNED_BY_THREAD);
+    _PyInterpreterFrame *gen_frame = &gen->gi_iframe;
+    _PyFrame_Copy(frame, gen_frame);
+    gen_frame->owner = FRAME_OWNED_BY_GENERATOR;
+    if (gen_frame->frame_obj != NULL) {
+        gen_frame->frame_obj->f_frame = gen_frame;
+    }
+    /* RETURN_GENERATOR stashed the caller's exception context in f_locals.
+     * If the body changed it (it suspended inside an exception handler),
+     * the current value belongs to the coroutine and the caller's value
+     * is restored. */
+    PyObject *caller_exc = gen_frame->f_locals;
+    gen_frame->f_locals = NULL;
+    _PyErr_StackItem *exc_info = tstate->exc_info;
+    assert(gen->gi_exc_state.exc_value == NULL);
+    if (exc_info->exc_value != caller_exc) {
+        gen->gi_exc_state.exc_value = exc_info->exc_value;
+        exc_info->exc_value = caller_exc;
+    }
+    else {
+        Py_XDECREF(caller_exc);
+    }
+    _PyThreadState_PopFrame(tstate, frame);
+    return gen_frame;
+}
+
 PyObject *
 _PyEval_GetAwaitable(PyObject *iterable, int oparg)
 {

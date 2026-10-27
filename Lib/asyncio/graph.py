@@ -1,6 +1,7 @@
 """Introspection utils for tasks call graphs."""
 
 import dataclasses
+import inspect
 import io
 import sys
 import types
@@ -35,6 +36,20 @@ class FutureCallGraph:
     future: futures.Future
     call_stack: tuple["FrameCallGraphEntry", ...]
     awaited_by: tuple["FutureCallGraph", ...]
+
+
+_CO_ASYNC_FLAGS = inspect.CO_COROUTINE | inspect.CO_ASYNC_GENERATOR
+_ASYNC_FRAME_TAGS = {
+    inspect.CO_COROUTINE: 'async ',
+    inspect.CO_ASYNC_GENERATOR: 'async generator ',
+}
+
+
+def _is_async_frame(f):
+    # A coroutine that is awaited right away runs without a coroutine
+    # object until it first suspends, so ``f.f_generator`` may be None
+    # for a coroutine frame; classify frames by their code instead.
+    return bool(f.f_code.co_flags & _CO_ASYNC_FLAGS)
 
 
 def _build_graph_for_future(
@@ -156,12 +171,10 @@ def capture_call_graph(
     try:
         while f is not None:
             # gh-156988: sync gen should not clear the call chain
-            is_async = isinstance(
-                f.f_generator, (types.CoroutineType, types.AsyncGeneratorType))
             call_stack.append(FrameCallGraphEntry(f))
 
-            if is_async:
-                if f.f_back is not None and f.f_back.f_generator is None:
+            if _is_async_frame(f):
+                if f.f_back is not None and not _is_async_frame(f.f_back):
                     # We've reached the bottom of the coroutine stack, which
                     # must be the Task that runs it.
                     break
@@ -219,10 +232,12 @@ def format_call_graph(
 
                 if f.f_generator is None:
                     f = ste.frame
+                    tag = _ASYNC_FRAME_TAGS.get(
+                        f.f_code.co_flags & _CO_ASYNC_FLAGS, '')
                     add_line(
                         f'  |   File {f.f_code.co_filename!r},'
                         f' line {f.f_lineno}, in'
-                        f' {f.f_code.co_qualname}()'
+                        f' {tag}{f.f_code.co_qualname}()'
                     )
                 else:
                     c = f.f_generator
