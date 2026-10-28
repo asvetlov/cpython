@@ -1736,8 +1736,8 @@ Special read-only attributes
 
    * - .. attribute:: frame.f_generator
      - The :term:`generator` or :term:`coroutine` object that owns this frame,
-       or ``None`` if the frame is a normal function or if no such object
-       exists yet.
+       or ``None`` if the frame is a normal function or if the generator
+       is not materialized yet.
 
        .. impl-detail::
 
