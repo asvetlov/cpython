@@ -9501,6 +9501,7 @@
             PyGenObject *gen;
             int lazy = frame->owner == FRAME_OWNED_BY_THREAD;
             if (lazy) {
+                assert(frame->lazy_coro);
                 stack_pointer[0] = retval;
                 stack_pointer += 1;
                 ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
@@ -9512,7 +9513,13 @@
                     SET_CURRENT_CACHED_VALUES(0);
                     JUMP_TO_ERROR();
                 }
-                gen->gi_exc_state.previous_item = tstate->exc_info;
+                _PyErr_StackItem *exc_info = tstate->exc_info;
+                gen->gi_exc_state.exc_value = exc_info->exc_value;
+                gen->gi_exc_state.previous_item = exc_info->previous_item;
+                assert(stack_pointer == _PyFrame_GetStackPointer(frame));
+                _PyFrame_StackPointerValidate(frame);
+                _PyThreadState_PopFrame(tstate, (_PyInterpreterFrame *)exc_info);
+                _PyFrame_StackPointerInvalidate(frame);
             }
             else {
                 gen = _PyGen_GetGeneratorFromFrame(frame);
@@ -20749,21 +20756,33 @@
             _PyStackRef res;
             assert(PyStackRef_FunctionCheck(frame->f_funcobj));
             PyFunctionObject *func = (PyFunctionObject *)PyStackRef_AsPyObjectBorrow(frame->f_funcobj);
-            #if TIER_ONE
-            _PyFrame_SetStackPointer(frame, stack_pointer);
-            _PyFrame_StackPointerValidate(frame);
-            _Py_CODEUNIT *send = _PyEval_LazyCoroSendInstr(frame, func);
-            _PyFrame_StackPointerInvalidate(frame);
-            #else
             _Py_CODEUNIT *send = NULL;
+            #if TIER_ONE
+            if (_PyFrame_GetCode(frame)->co_flags & CO_COROUTINE) {
+                send = _PyEval_LazyCoroSendInstr(tstate, frame);
+            }
             #endif
+            _PyErr_StackItem *exc_info = NULL;
             if (send != NULL) {
-                _PyInterpreterFrame *prev = frame->previous;
-                assert(frame->f_locals == NULL);
                 _PyFrame_SetStackPointer(frame, stack_pointer);
                 _PyFrame_StackPointerValidate(frame);
-                frame->f_locals = Py_XNewRef(tstate->exc_info->exc_value);
+                exc_info = (_PyErr_StackItem *)_PyThreadState_PushFrame(
+                    tstate, sizeof(_PyErr_StackItem) / sizeof(PyObject *));
                 _PyFrame_StackPointerInvalidate(frame);
+                if (exc_info == NULL) {
+                    assert(stack_pointer == _PyFrame_GetStackPointer(frame));
+                    _PyFrame_StackPointerValidate(frame);
+                    _PyErr_Clear(tstate);
+                    _PyFrame_StackPointerInvalidate(frame);
+                    send = NULL;
+                }
+            }
+            if (send != NULL) {
+                frame->lazy_coro = 1;
+                exc_info->exc_value = NULL;
+                exc_info->previous_item = tstate->exc_info;
+                tstate->exc_info = exc_info;
+                _PyInterpreterFrame *prev = frame->previous;
                 _PyFrame_StackPush(prev, PyStackRef_None);
                 _PyFrame_StackPush(prev, PyStackRef_NULL);
                 prev->instr_ptr = send;

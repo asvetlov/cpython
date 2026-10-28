@@ -2,6 +2,7 @@ import asyncio
 import inspect
 import io
 import sys
+import types
 import unittest
 from unittest import mock
 
@@ -28,6 +29,8 @@ def capture_test_stack(*, fut=None, depth=1):
                 return "a"
             if flags & inspect.CO_ASYNC_GENERATOR:
                 return "ag"
+            if flags & inspect.CO_GENERATOR:
+                return "g"
             return "s"
 
         ret.append(
@@ -824,6 +827,26 @@ class CallStackTestBase:
 
         await main()
         self.assertEqual(stack[:3], ['gen', 'middle', 'main'])
+
+    async def test_capture_call_graph_through_generator_based_coroutine(self):
+        # A native coroutine driven by a generator-based coroutine
+        # (yield from) keeps the frames of its callers.
+        stack = None
+
+        async def native():
+            nonlocal stack
+            graph = asyncio.capture_call_graph()
+            stack = [entry.frame.f_code.co_name for entry in graph.call_stack]
+
+        @types.coroutine
+        def legacy():
+            return (yield from native())
+
+        async def main():
+            await legacy()
+
+        await main()
+        self.assertEqual(stack[:3], ['native', 'legacy', 'main'])
 
 
 @unittest.skipIf(

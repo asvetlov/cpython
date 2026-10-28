@@ -2063,10 +2063,16 @@ fail_post_args:
     return -1;
 }
 
+static PyObject *pop_lazy_coro_exc_state(PyThreadState *, _PyInterpreterFrame *);
+
 static void
 clear_thread_frame(PyThreadState *tstate, _PyInterpreterFrame * frame)
 {
     assert(frame->owner == FRAME_OWNED_BY_THREAD);
+    PyObject *lazy_exc = NULL;
+    if (frame->lazy_coro) {
+        lazy_exc = pop_lazy_coro_exc_state(tstate, frame);
+    }
     // Make sure that this is, indeed, the top frame. We can't check this in
     // _PyThreadState_PopFrame, since f_code is already cleared at that point:
     assert((PyObject **)frame + _PyFrame_GetCode(frame)->co_framesize ==
@@ -2075,6 +2081,7 @@ clear_thread_frame(PyThreadState *tstate, _PyInterpreterFrame * frame)
     _PyFrame_ClearExceptCode(frame);
     PyStackRef_CLEAR(frame->f_executable);
     _PyThreadState_PopFrame(tstate, frame);
+    Py_XDECREF(lazy_exc);
 }
 
 static void
@@ -3752,64 +3759,87 @@ _PyEval_LoadGlobalStackRef(PyObject *globals, PyObject *builtins, PyObject *name
 
 /* RETURN_GENERATOR support for coroutines that are awaited immediately.
  *
- * If `frame` is a coroutine frame and its caller's next instructions are
- * the await sequence `GET_AWAITABLE; PUSH_NULL; LOAD_COMMON_CONSTANT None; SEND`,
- * return the SEND instruction, otherwise NULL. Instrumented or
- * EXTENDED_ARG-prefixed instructions don't match, so the regular path
- * is taken for them. */
+ * If the caller of the coroutine frame `frame` is a Python frame whose next
+ * instructions are the await sequence
+ * `GET_AWAITABLE; PUSH_NULL; LOAD_COMMON_CONSTANT None; SEND; ...; END_SEND`,
+ * return the SEND instruction, otherwise NULL. Instrumented,
+ * EXTENDED_ARG-prefixed or executor-replaced instructions don't match, so
+ * the regular path is taken for them, and so is it while the JIT is
+ * recording a trace (tier 2 creates coroutines eagerly) and while
+ * coroutine origin tracking is on (the origin is captured at creation). */
 _Py_CODEUNIT *
-_PyEval_LazyCoroSendInstr(_PyInterpreterFrame *frame, PyFunctionObject *func)
+_PyEval_LazyCoroSendInstr(PyThreadState *tstate, _PyInterpreterFrame *frame)
 {
-    int flags = ((PyCodeObject *)func->func_code)->co_flags;
+    int flags = _PyFrame_GetCode(frame)->co_flags;
     if ((flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR | CO_OPTIMIZED))
         != (CO_COROUTINE | CO_OPTIMIZED))
     {
         return NULL;
     }
+    if (tstate->coroutine_origin_tracking_depth != 0) {
+        return NULL;
+    }
+#ifdef _Py_TIER2
+    _PyJitTracerState *tracer = ((_PyThreadStateImpl *)tstate)->jit_tracer_state;
+    if (tracer != NULL && tracer->is_tracing) {
+        return NULL;
+    }
+#endif
     _PyInterpreterFrame *prev = frame->previous;
     if (prev->owner >= FRAME_OWNED_BY_INTERPRETER) {
         /* Called from C: the caller can't be inspected. */
         return NULL;
     }
     _Py_CODEUNIT *instr = prev->instr_ptr + prev->return_offset;
-    if (_PyOpcode_Deopt[instr[0].op.code] != GET_AWAITABLE ||
-        _PyOpcode_Deopt[instr[1].op.code] != PUSH_NULL ||
-        _PyOpcode_Deopt[instr[2].op.code] != LOAD_COMMON_CONSTANT ||
+    if (instr[0].op.code != GET_AWAITABLE ||
+        instr[1].op.code != PUSH_NULL ||
+        instr[2].op.code != LOAD_COMMON_CONSTANT ||
         _PyOpcode_Deopt[instr[3].op.code] != SEND)
     {
         return NULL;
     }
-    return &instr[3];
+    _Py_CODEUNIT *send = &instr[3];
+    _Py_CODEUNIT *end = send + 1 + INLINE_CACHE_ENTRIES_SEND + send->op.arg;
+    if (end->op.code != END_SEND) {
+        /* INSTRUMENTED_END_SEND needs the coroutine object. */
+        return NULL;
+    }
+    return send;
+}
+
+/* Pop the exception state that RETURN_GENERATOR gave a lazily started
+ * coroutine body, restoring the caller's. Returns the body's exception,
+ * if any (a new reference). */
+static PyObject *
+pop_lazy_coro_exc_state(PyThreadState *tstate, _PyInterpreterFrame *frame)
+{
+    assert(frame->lazy_coro);
+    _PyErr_StackItem *exc_info = tstate->exc_info;
+    tstate->exc_info = exc_info->previous_item;
+    PyObject *exc_value = exc_info->exc_value;
+    _PyThreadState_PopFrame(tstate, (_PyInterpreterFrame *)exc_info);
+    frame->lazy_coro = 0;
+    return exc_value;
 }
 
 /* YIELD_VALUE support: move the frame of a lazily created coroutine
- * from the thread's data stack into `gen`, and split the exception
- * state the body shared with its caller. Returns the new frame. */
+ * from the thread's data stack into `gen`. Returns the new frame. */
 _PyInterpreterFrame *
 _PyEval_MoveLazyCoroFrame(PyThreadState *tstate, PyGenObject *gen,
                           _PyInterpreterFrame *frame)
 {
     assert(frame->owner == FRAME_OWNED_BY_THREAD);
+    assert(frame->lazy_coro);
+    assert((PyObject **)frame + _PyFrame_GetCode(frame)->co_framesize ==
+           tstate->datastack_top);
     _PyInterpreterFrame *gen_frame = &gen->gi_iframe;
     _PyFrame_Copy(frame, gen_frame);
     gen_frame->owner = FRAME_OWNED_BY_GENERATOR;
-    if (gen_frame->frame_obj != NULL) {
-        gen_frame->frame_obj->f_frame = gen_frame;
-    }
-    /* RETURN_GENERATOR stashed the caller's exception context in f_locals.
-     * If the body changed it (it suspended inside an exception handler),
-     * the current value belongs to the coroutine and the caller's value
-     * is restored. */
-    PyObject *caller_exc = gen_frame->f_locals;
-    gen_frame->f_locals = NULL;
-    _PyErr_StackItem *exc_info = tstate->exc_info;
-    assert(gen->gi_exc_state.exc_value == NULL);
-    if (exc_info->exc_value != caller_exc) {
-        gen->gi_exc_state.exc_value = exc_info->exc_value;
-        exc_info->exc_value = caller_exc;
-    }
-    else {
-        Py_XDECREF(caller_exc);
+    PyFrameObject *f = gen_frame->frame_obj;
+    if (f != NULL) {
+        Py_BEGIN_CRITICAL_SECTION(f);
+        f->f_frame = gen_frame;
+        Py_END_CRITICAL_SECTION();
     }
     _PyThreadState_PopFrame(tstate, frame);
     return gen_frame;

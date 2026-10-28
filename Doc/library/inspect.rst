@@ -151,7 +151,8 @@ attributes (see :ref:`import-mod-attrs` for module attributes):
 |                 |                   | coroutine object that     |
 |                 |                   | owns this frame, or       |
 |                 |                   | ``None`` if the frame is  |
-|                 |                   | of a regular function     |
+|                 |                   | of a regular function or  |
+|                 |                   | no such object exists yet |
 +-----------------+-------------------+---------------------------+
 |                 | f_trace           | tracing function for this |
 |                 |                   | frame, or ``None``        |

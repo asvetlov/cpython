@@ -1,6 +1,7 @@
 import ast
 import contextlib
 import copy
+import builtins
 import gc
 import inspect
 import pickle
@@ -2596,7 +2597,6 @@ class UnawaitedWarningDuringShutdownTest(unittest.TestCase):
 
 
 @support.cpython_only
-@unittest.skipIf(_testcapi is None, "requires _testcapi")
 class LazyCoroutineTest(unittest.TestCase):
     """A coroutine that is awaited right away (``await f()``) runs in
     the calling thread's frame and only gets a coroutine object when
@@ -2824,11 +2824,34 @@ class LazyCoroutineTest(unittest.TestCase):
             _, (eager, lazy) = run_async(outer())
         finally:
             sys.set_coroutine_origin_tracking_depth(orig_depth)
+        # Origin tracking disables the lazy path: the origin is the
+        # call, not the await, and is captured at creation.
         self.assertEqual(eager[0], __file__)
         self.assertEqual(eager[2], "outer")
         self.assertEqual(lazy[0], __file__)
         self.assertEqual(lazy[2], "outer")
         self.assertEqual(lazy[1], eager[1] + 2)
+
+    def test_origin_tracking_multiline_await(self):
+        orig_depth = sys.get_coroutine_origin_tracking_depth()
+
+        async def inner():
+            await AsyncYield(1)
+            return sys._getframe().f_generator.cr_origin
+
+        async def outer():
+            origin = await (
+                inner()
+            )
+            return origin[0][1] - outer.__code__.co_firstlineno
+
+        sys.set_coroutine_origin_tracking_depth(1)
+        try:
+            _, line = run_async(outer())
+        finally:
+            sys.set_coroutine_origin_tracking_depth(orig_depth)
+        # The line of the call, not of the await.
+        self.assertEqual(line, 2)
 
     def test_settrace_events(self):
         async def inner():
@@ -2872,9 +2895,13 @@ class LazyCoroutineTest(unittest.TestCase):
             return await inner()
 
         E = sys.monitoring.events
+        # No LINE events: they instrument the caller's SEND, which
+        # makes the await take the regular path.
         names = {E.PY_START: "start", E.PY_RESUME: "resume",
                  E.PY_RETURN: "return", E.PY_YIELD: "yield",
-                 E.LINE: "line"}
+                 E.STOP_ITERATION: "stop_iteration"}
+        codes = {inner.__code__: "inner", eager.__code__: "outer",
+                 lazy.__code__: "outer"}
 
         def monitor(coro_fn):
             events = []
@@ -2883,20 +2910,167 @@ class LazyCoroutineTest(unittest.TestCase):
             try:
                 for event, name in names.items():
                     def callback(code, offset, *args, name=name):
-                        if code is inner.__code__:
-                            events.append((name, offset))
+                        if code in codes:
+                            events.append(
+                                (codes[code], name, type(args[-1]) if args else None))
                     sys.monitoring.register_callback(tool, event, callback)
-                sys.monitoring.set_events(
-                    tool, E.PY_START | E.PY_RESUME | E.PY_RETURN | E.PY_YIELD | E.LINE)
+                sys.monitoring.set_events(tool, sum(names))
                 result = run_async(coro_fn())
-                sys.monitoring.set_events(tool, 0)
             finally:
+                sys.monitoring.set_events(tool, 0)
                 sys.monitoring.free_tool_id(tool)
             return events, result
 
         self.assertEqual(monitor(lazy), monitor(eager))
+        self.assertIn(("outer", "stop_iteration", StopIteration),
+                      monitor(lazy)[0])
+
+    def test_stop_iteration_event_without_suspending(self):
+        async def inner():
+            return 42
+
+        async def outer():
+            return await inner()
+
+        E = sys.monitoring.events
+        events = []
+        tool = sys.monitoring.DEBUGGER_ID
+        sys.monitoring.use_tool_id(tool, "test")
+        try:
+            def callback(code, offset, exc):
+                if code is outer.__code__:
+                    events.append(exc.value)
+            sys.monitoring.register_callback(tool, E.STOP_ITERATION, callback)
+            sys.monitoring.set_events(tool, E.STOP_ITERATION)
+            self.assertEqual(run_async(outer()), ([], 42))
+        finally:
+            sys.monitoring.set_events(tool, 0)
+            sys.monitoring.free_tool_id(tool)
+        self.assertEqual(events, [42])
+
+    def test_exc_state_after_suspending_inside_handler(self):
+        # The coroutine's own exception state must not keep the
+        # caller's exception once its handler is done.
+        async def inner():
+            try:
+                raise KeyError
+            except KeyError:
+                await AsyncYield(1)
+            await AsyncYield(2)
+            return sys.exc_info()[1]
+
+        async def outer():
+            try:
+                raise TypeError
+            except TypeError:
+                return await inner()
+
+        coro = outer()
+        coro.send(None)
+        inner_coro = coro.cr_await
+        inner_coro.send(None)
+        self.assertNotIn(TypeError,
+                         map(type, gc.get_referents(inner_coro)))
+        # Resumed directly, not through outer: no handled exception.
+        with self.assertRaises(StopIteration) as cm:
+            inner_coro.send(None)
+        self.assertIsNone(cm.exception.value)
+        coro.close()
+
+    def test_throw_into_coroutine_suspended_inside_handler(self):
+        async def inner():
+            try:
+                raise KeyError
+            except KeyError:
+                try:
+                    await AsyncYield(1)
+                except ZeroDivisionError:
+                    pass
+            return sys.exception()
+
+        async def outer():
+            try:
+                raise TypeError
+            except TypeError:
+                result = await inner()
+                self.assertIsInstance(sys.exception(), TypeError)
+                return result
+
+        coro = outer()
+        self.assertEqual(coro.send(None), 1)
+        with self.assertRaises(StopIteration) as cm:
+            coro.throw(ZeroDivisionError)
+        self.assertIsNone(cm.exception.value)
+
+    def test_import_hook_locals(self):
+        seen = []
+        orig_import = builtins.__import__
+
+        def hook(name, globals=None, locals=None, fromlist=(), level=0):
+            seen.append(locals)
+            return orig_import(name, globals, locals, fromlist, level)
+
+        async def inner():
+            import sys as _sys
+            return _sys
+
+        async def outer():
+            try:
+                raise TypeError
+            except TypeError:
+                return await inner()
+
+        with support.swap_attr(builtins, "__import__", hook):
+            self.assertEqual(run_async(outer()), ([], sys))
+        self.assertEqual(seen, [None])
+
+    def test_traceback_frame_keeps_no_caller_exception(self):
+        async def inner():
+            raise ValueError
+
+        async def outer():
+            try:
+                raise TypeError
+            except TypeError:
+                try:
+                    await inner()
+                except ValueError as exc:
+                    return exc.__traceback__.tb_next.tb_frame
+
+        _, frame = run_async(outer())
+        self.assertIs(frame.f_code, inner.__code__)
+        self.assertNotIn(TypeError, map(type, gc.get_referents(frame)))
+
+    @unittest.skipIf(_testcapi is None, "requires _testcapi")
+    def test_memory_error_at_first_suspension(self):
+        @types.coroutine
+        def suspend():
+            yield 1
+
+        awaitable = suspend()
+
+        async def inner():
+            _testcapi.set_nomemory(0, 1)
+            try:
+                await awaitable
+            finally:
+                _testcapi.remove_mem_hooks()
+            return "resumed"
+
+        async def outer():
+            return await inner()
+
+        coro = outer()
+        try:
+            with self.assertRaises(MemoryError):
+                coro.send(None)
+        finally:
+            _testcapi.remove_mem_hooks()
+            awaitable.close()
 
 
+@support.cpython_only
+@unittest.skipIf(_testcapi is None, "requires _testcapi")
 class CAPITest(unittest.TestCase):
 
     def test_tp_await_1(self):

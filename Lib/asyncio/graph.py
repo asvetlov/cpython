@@ -38,18 +38,24 @@ class FutureCallGraph:
     awaited_by: tuple["FutureCallGraph", ...]
 
 
+# A coroutine that is awaited right away runs without a coroutine
+# object until it first suspends, so ``f.f_generator`` may be None
+# for a coroutine frame; classify frames by their code instead.
 _CO_ASYNC_FLAGS = inspect.CO_COROUTINE | inspect.CO_ASYNC_GENERATOR
-_ASYNC_FRAME_TAGS = {
+_CO_GEN_FLAGS = _CO_ASYNC_FLAGS | inspect.CO_GENERATOR
+_FRAME_TAGS = {
     inspect.CO_COROUTINE: 'async ',
     inspect.CO_ASYNC_GENERATOR: 'async generator ',
+    inspect.CO_GENERATOR: 'generator ',
 }
 
 
 def _is_async_frame(f):
-    # A coroutine that is awaited right away runs without a coroutine
-    # object until it first suspends, so ``f.f_generator`` may be None
-    # for a coroutine frame; classify frames by their code instead.
     return bool(f.f_code.co_flags & _CO_ASYNC_FLAGS)
+
+
+def _is_sync_frame(f):
+    return not (f.f_code.co_flags & _CO_GEN_FLAGS)
 
 
 def _build_graph_for_future(
@@ -174,7 +180,7 @@ def capture_call_graph(
             call_stack.append(FrameCallGraphEntry(f))
 
             if _is_async_frame(f):
-                if f.f_back is not None and not _is_async_frame(f.f_back):
+                if f.f_back is not None and _is_sync_frame(f.f_back):
                     # We've reached the bottom of the coroutine stack, which
                     # must be the Task that runs it.
                     break
@@ -229,38 +235,12 @@ def format_call_graph(
             )
             for ste in st.call_stack:
                 f = ste.frame
-
-                if f.f_generator is None:
-                    f = ste.frame
-                    tag = _ASYNC_FRAME_TAGS.get(
-                        f.f_code.co_flags & _CO_ASYNC_FLAGS, '')
-                    add_line(
-                        f'  |   File {f.f_code.co_filename!r},'
-                        f' line {f.f_lineno}, in'
-                        f' {tag}{f.f_code.co_qualname}()'
-                    )
-                else:
-                    c = f.f_generator
-
-                    try:
-                        f = c.cr_frame
-                        code = c.cr_code
-                        tag = 'async'
-                    except AttributeError:
-                        try:
-                            f = c.ag_frame
-                            code = c.ag_code
-                            tag = 'async generator'
-                        except AttributeError:
-                            f = c.gi_frame
-                            code = c.gi_code
-                            tag = 'generator'
-
-                    add_line(
-                        f'  |   File {f.f_code.co_filename!r},'
-                        f' line {f.f_lineno}, in'
-                        f' {tag} {code.co_qualname}()'
-                    )
+                tag = _FRAME_TAGS.get(f.f_code.co_flags & _CO_GEN_FLAGS, '')
+                add_line(
+                    f'  |   File {f.f_code.co_filename!r},'
+                    f' line {f.f_lineno}, in'
+                    f' {tag}{f.f_code.co_qualname}()'
+                )
 
         if st.awaited_by:
             add_line(

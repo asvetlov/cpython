@@ -437,7 +437,11 @@ dummy_func(
 
         tier1 inst(INSTRUMENTED_END_SEND, (receiver, index_or_null, value -- val)) {
             PyObject *receiver_o = PyStackRef_AsPyObjectBorrow(receiver);
-            if (PyGen_Check(receiver_o) || PyCoro_CheckExact(receiver_o)) {
+            /* None is the placeholder of a lazily started coroutine that
+             * returned before it was created (see RETURN_GENERATOR). */
+            if (PyGen_Check(receiver_o) || PyCoro_CheckExact(receiver_o) ||
+                Py_IsNone(receiver_o))
+            {
                 int err = monitor_stop_iteration(tstate, frame, this_instr, PyStackRef_AsPyObjectBorrow(value));
                 if (err) {
                     ERROR_NO_POP();
@@ -1860,11 +1864,17 @@ dummy_func(
             PyGenObject *gen;
             int lazy = frame->owner == FRAME_OWNED_BY_THREAD;
             if (lazy) {
+                assert(frame->lazy_coro);
                 gen = (PyGenObject *)_PyCoro_MaterializeLazy(frame);
                 if (gen == NULL) {
                     ERROR_NO_POP();
                 }
-                gen->gi_exc_state.previous_item = tstate->exc_info;
+                /* Move the body's exception state (see RETURN_GENERATOR)
+                 * into the coroutine, where SEND_GEN would have put it. */
+                _PyErr_StackItem *exc_info = tstate->exc_info;
+                gen->gi_exc_state.exc_value = exc_info->exc_value;
+                gen->gi_exc_state.previous_item = exc_info->previous_item;
+                _PyThreadState_PopFrame(tstate, (_PyInterpreterFrame *)exc_info);
             }
             else {
                 gen = _PyGen_GetGeneratorFromFrame(frame);
@@ -1985,9 +1995,9 @@ dummy_func(
 
         tier1 inst(CLEANUP_THROW, (sub_iter, null_in, last_sent_val, exc_value_st -- none, null_out, value)) {
             PyObject *exc_value = PyStackRef_AsPyObjectBorrow(exc_value_st);
-            #if !_Py_TAIL_CALL_INTERP
-            assert(throwflag);
-            #endif
+            /* Reached on throw()/close(), or when a lazily started
+             * coroutine could not be created at its first suspension
+             * (see _YIELD_VALUE). */
             assert(exc_value && PyExceptionInstance_Check(exc_value));
             int matches = PyErr_GivenExceptionMatches(exc_value, PyExc_StopIteration);
             if (matches) {
@@ -5829,11 +5839,26 @@ dummy_func(
         inst(RETURN_GENERATOR, (-- res)) {
             assert(PyStackRef_FunctionCheck(frame->f_funcobj));
             PyFunctionObject *func = (PyFunctionObject *)PyStackRef_AsPyObjectBorrow(frame->f_funcobj);
-            #if TIER_ONE
-            _Py_CODEUNIT *send = _PyEval_LazyCoroSendInstr(frame, func);
-            #else
             _Py_CODEUNIT *send = NULL;
+            #if TIER_ONE
+            if (_PyFrame_GetCode(frame)->co_flags & CO_COROUTINE) {
+                send = _PyEval_LazyCoroSendInstr(tstate, frame);
+            }
             #endif
+            _PyErr_StackItem *exc_info = NULL;
+            if (send != NULL) {
+                /* The body gets its own exception state, as SEND_GEN
+                 * would have given it. It lives on the data stack right
+                 * after this frame; clear_thread_frame() and _YIELD_VALUE
+                 * pop it. */
+                exc_info = (_PyErr_StackItem *)_PyThreadState_PushFrame(
+                    tstate, sizeof(_PyErr_StackItem) / sizeof(PyObject *));
+                if (exc_info == NULL) {
+                    /* Out of memory: fall back to the regular path. */
+                    _PyErr_Clear(tstate);
+                    send = NULL;
+                }
+            }
             if (send != NULL) {
                 /* The caller is going to await the coroutine right away.
                  * Keep executing its body in this frame, and only create
@@ -5842,12 +5867,11 @@ dummy_func(
                  * had pushed this frame: `[receiver, NULL]` on its stack,
                  * with the coroutine slot filled in on materialization,
                  * and its instruction pointer at the SEND. */
+                frame->lazy_coro = 1;
+                exc_info->exc_value = NULL;
+                exc_info->previous_item = tstate->exc_info;
+                tstate->exc_info = exc_info;
                 _PyInterpreterFrame *prev = frame->previous;
-                /* The caller's exception context is needed to split
-                 * the exception state on materialization. f_locals is
-                 * unused for optimized code, so stash it there. */
-                assert(frame->f_locals == NULL);
-                frame->f_locals = Py_XNewRef(tstate->exc_info->exc_value);
                 _PyFrame_StackPush(prev, PyStackRef_None);
                 _PyFrame_StackPush(prev, PyStackRef_NULL);
                 prev->instr_ptr = send;
