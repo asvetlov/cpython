@@ -152,7 +152,8 @@ attributes (see :ref:`import-mod-attrs` for module attributes):
 |                 |                   | owns this frame, or       |
 |                 |                   | ``None`` if the frame is  |
 |                 |                   | of a regular function or  |
-|                 |                   | no such object exists yet |
+|                 |                   | the generator is not      |
+|                 |                   | materialized yet          |
 +-----------------+-------------------+---------------------------+
 |                 | f_trace           | tracing function for this |
 |                 |                   | frame, or ``None``        |
