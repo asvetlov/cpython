@@ -506,7 +506,8 @@ codegen_add_yield_from(compiler *c, location loc, int await)
     USE_LABEL(c, send);
     ADDOP_JUMP(c, loc, SEND, exit);
     // Set up a virtual try/except to handle when StopIteration is raised during
-    // a close or throw call. The only way YIELD_VALUE raises if they do!
+    // a close or throw call. The only ways YIELD_VALUE raises are if they do,
+    // or if a lazily started coroutine (see RETURN_GENERATOR) can't be created.
     ADDOP_JUMP(c, loc, SETUP_FINALLY, fail);
     ADDOP_I(c, loc, YIELD_VALUE, 1);
     ADDOP(c, NO_LOCATION, POP_BLOCK);
