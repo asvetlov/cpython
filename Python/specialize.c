@@ -262,6 +262,7 @@ _PyCode_Quicken(_Py_CODEUNIT *instructions, Py_ssize_t size, int enable_counters
 #define SPEC_FAIL_CALL_INIT_NOT_SIMPLE 30
 #define SPEC_FAIL_CALL_METACLASS 31
 #define SPEC_FAIL_CALL_INIT_NOT_INLINE_VALUES 32
+#define SPEC_FAIL_CALL_NOT_COROUTINE 33
 
 /* COMPARE_OP */
 #define SPEC_FAIL_COMPARE_OP_DIFFERENT_TYPES 12
@@ -1751,40 +1752,70 @@ specialize_method_descriptor(PyMethodDescrObject *descr, PyObject *self_or_null,
     return 0;
 }
 
+/* Can the ASYNC_CALL or ASYNC_CALL_KW at "instr", a call to a function
+ * with the code "code", be specialized to one of the ASYNC_CALL_*
+ * instructions? These start the new coroutine in place of the SEND that
+ * awaits it. GET_AWAITABLE never fails for a new coroutine. */
+static bool
+can_start_coroutine(PyCodeObject *code, _Py_CODEUNIT *instr)
+{
+    int coro_flags = code->co_flags &
+        (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR);
+    if (coro_flags != CO_COROUTINE) {
+        return false;
+    }
+    _Py_CODEUNIT *next = instr + 1 + _PyOpcode_Caches[_PyOpcode_Deopt[instr->op.code]];
+    return _PyCode_AwaitedCallSend(next) != NULL;
+}
+
 static int
 specialize_py_call(PyFunctionObject *func, _Py_CODEUNIT *instr, int nargs,
-                   bool bound_method)
+                   bool bound_method, bool async_call)
 {
     _PyCallCache *cache = (_PyCallCache *)(instr + 1);
     PyCodeObject *code = (PyCodeObject *)func->func_code;
     int kind = function_kind(code);
     /* Don't specialize if PEP 523 is active */
     if (!_PyInterpreterState_IsSpecializationEnabled(_PyInterpreterState_GET())) {
-        SPECIALIZATION_FAIL(CALL, SPEC_FAIL_CALL_PEP_523);
+        SPECIALIZATION_FAIL(_PyOpcode_Deopt[instr->op.code], SPEC_FAIL_CALL_PEP_523);
         return -1;
     }
     if (func->vectorcall != _PyFunction_Vectorcall) {
-        SPECIALIZATION_FAIL(CALL, SPEC_FAIL_CALL_VECTORCALL);
+        SPECIALIZATION_FAIL(_PyOpcode_Deopt[instr->op.code], SPEC_FAIL_CALL_VECTORCALL);
         return -1;
     }
     int argcount = -1;
     if (kind == SPEC_FAIL_CODE_NOT_OPTIMIZED) {
-        SPECIALIZATION_FAIL(CALL, SPEC_FAIL_CODE_NOT_OPTIMIZED);
+        SPECIALIZATION_FAIL(_PyOpcode_Deopt[instr->op.code], SPEC_FAIL_CODE_NOT_OPTIMIZED);
         return -1;
     }
     if (kind == SIMPLE_FUNCTION) {
         argcount = code->co_argcount;
     }
+    if (async_call && !can_start_coroutine(code, instr)) {
+        SPECIALIZATION_FAIL(_PyOpcode_Deopt[instr->op.code], SPEC_FAIL_CALL_NOT_COROUTINE);
+        return -1;
+    }
     int version = _PyFunction_GetVersionForCurrentState(func);
     if (!_PyFunction_IsVersionValid(version)) {
-        SPECIALIZATION_FAIL(CALL, SPEC_FAIL_OUT_OF_VERSIONS);
+        SPECIALIZATION_FAIL(_PyOpcode_Deopt[instr->op.code], SPEC_FAIL_OUT_OF_VERSIONS);
         return -1;
     }
     write_u32(cache->func_version, version);
     uint8_t opcode;
     if (argcount == nargs + bound_method) {
-        opcode =
-            bound_method ? CALL_BOUND_METHOD_EXACT_ARGS : CALL_PY_EXACT_ARGS;
+        if (async_call) {
+            opcode = bound_method ?
+                ASYNC_CALL_BOUND_METHOD_EXACT_ARGS : ASYNC_CALL_PY_EXACT_ARGS;
+        }
+        else {
+            opcode = bound_method ?
+                CALL_BOUND_METHOD_EXACT_ARGS : CALL_PY_EXACT_ARGS;
+        }
+    }
+    else if (async_call) {
+        opcode = bound_method ?
+            ASYNC_CALL_BOUND_METHOD_GENERAL : ASYNC_CALL_PY_GENERAL;
     }
     else {
         opcode = bound_method ? CALL_BOUND_METHOD_GENERAL : CALL_PY_GENERAL;
@@ -1793,34 +1824,44 @@ specialize_py_call(PyFunctionObject *func, _Py_CODEUNIT *instr, int nargs,
     return 0;
 }
 
-
 static int
 specialize_py_call_kw(PyFunctionObject *func, _Py_CODEUNIT *instr, int nargs,
-                   bool bound_method)
+                   bool bound_method, bool async_call)
 {
     _PyCallCache *cache = (_PyCallCache *)(instr + 1);
     PyCodeObject *code = (PyCodeObject *)func->func_code;
     int kind = function_kind(code);
     /* Don't specialize if PEP 523 is active */
     if (!_PyInterpreterState_IsSpecializationEnabled(_PyInterpreterState_GET())) {
-        SPECIALIZATION_FAIL(CALL, SPEC_FAIL_CALL_PEP_523);
+        SPECIALIZATION_FAIL(_PyOpcode_Deopt[instr->op.code], SPEC_FAIL_CALL_PEP_523);
         return -1;
     }
     if (func->vectorcall != _PyFunction_Vectorcall) {
-        SPECIALIZATION_FAIL(CALL, SPEC_FAIL_CALL_VECTORCALL);
+        SPECIALIZATION_FAIL(_PyOpcode_Deopt[instr->op.code], SPEC_FAIL_CALL_VECTORCALL);
         return -1;
     }
     if (kind == SPEC_FAIL_CODE_NOT_OPTIMIZED) {
-        SPECIALIZATION_FAIL(CALL, SPEC_FAIL_CODE_NOT_OPTIMIZED);
+        SPECIALIZATION_FAIL(_PyOpcode_Deopt[instr->op.code], SPEC_FAIL_CODE_NOT_OPTIMIZED);
+        return -1;
+    }
+    if (async_call && !can_start_coroutine(code, instr)) {
+        SPECIALIZATION_FAIL(_PyOpcode_Deopt[instr->op.code], SPEC_FAIL_CALL_NOT_COROUTINE);
         return -1;
     }
     int version = _PyFunction_GetVersionForCurrentState(func);
     if (!_PyFunction_IsVersionValid(version)) {
-        SPECIALIZATION_FAIL(CALL, SPEC_FAIL_OUT_OF_VERSIONS);
+        SPECIALIZATION_FAIL(_PyOpcode_Deopt[instr->op.code], SPEC_FAIL_OUT_OF_VERSIONS);
         return -1;
     }
     write_u32(cache->func_version, version);
-    specialize(instr, bound_method ? CALL_KW_BOUND_METHOD : CALL_KW_PY);
+    uint8_t opcode;
+    if (async_call) {
+        opcode = bound_method ? ASYNC_CALL_KW_BOUND_METHOD : ASYNC_CALL_KW_PY;
+    }
+    else {
+        opcode = bound_method ? CALL_KW_BOUND_METHOD : CALL_KW_PY;
+    }
+    specialize(instr, opcode);
     return 0;
 }
 
@@ -1881,7 +1922,7 @@ _Py_Specialize_Call(_PyStackRef callable_st, _PyStackRef self_or_null_st, _Py_CO
         fail = specialize_c_call(callable, instr, nargs);
     }
     else if (PyFunction_Check(callable)) {
-        fail = specialize_py_call((PyFunctionObject *)callable, instr, nargs, false);
+        fail = specialize_py_call((PyFunctionObject *)callable, instr, nargs, false, false);
     }
     else if (PyType_Check(callable)) {
         fail = specialize_class_call(callable, instr, nargs);
@@ -1894,7 +1935,7 @@ _Py_Specialize_Call(_PyStackRef callable_st, _PyStackRef self_or_null_st, _Py_CO
     else if (PyMethod_Check(callable)) {
         PyObject *func = ((PyMethodObject *)callable)->im_func;
         if (PyFunction_Check(func)) {
-            fail = specialize_py_call((PyFunctionObject *)func, instr, nargs, true);
+            fail = specialize_py_call((PyFunctionObject *)func, instr, nargs, true, false);
         }
         else {
             SPECIALIZATION_FAIL(CALL, SPEC_FAIL_CALL_BOUND_METHOD);
@@ -1920,12 +1961,12 @@ _Py_Specialize_CallKw(_PyStackRef callable_st, _Py_CODEUNIT *instr, int nargs)
     assert(_Py_OPCODE(*instr) != INSTRUMENTED_CALL_KW);
     int fail;
     if (PyFunction_Check(callable)) {
-        fail = specialize_py_call_kw((PyFunctionObject *)callable, instr, nargs, false);
+        fail = specialize_py_call_kw((PyFunctionObject *)callable, instr, nargs, false, false);
     }
     else if (PyMethod_Check(callable)) {
         PyObject *func = ((PyMethodObject *)callable)->im_func;
         if (PyFunction_Check(func)) {
-            fail = specialize_py_call_kw((PyFunctionObject *)func, instr, nargs, true);
+            fail = specialize_py_call_kw((PyFunctionObject *)func, instr, nargs, true, false);
         }
         else {
             SPECIALIZATION_FAIL(CALL_KW, SPEC_FAIL_CALL_BOUND_METHOD);
@@ -1935,6 +1976,70 @@ _Py_Specialize_CallKw(_PyStackRef callable_st, _Py_CODEUNIT *instr, int nargs)
     else {
         specialize(instr, CALL_KW_NON_PY);
         fail = 0;
+    }
+    if (fail) {
+        unspecialize(instr);
+    }
+}
+
+/* Only calls to coroutine functions are specialized: the result of any
+ * other call is awaited by the instructions following ASYNC_CALL. */
+void
+_Py_Specialize_AsyncCall(_PyStackRef callable_st, _Py_CODEUNIT *instr, int nargs)
+{
+    PyObject *callable = PyStackRef_AsPyObjectBorrow(callable_st);
+
+    assert(ENABLE_SPECIALIZATION);
+    assert(_PyOpcode_Caches[ASYNC_CALL] == INLINE_CACHE_ENTRIES_ASYNC_CALL);
+    assert(_Py_OPCODE(*instr) != INSTRUMENTED_ASYNC_CALL);
+    int fail;
+    if (PyFunction_Check(callable)) {
+        fail = specialize_py_call((PyFunctionObject *)callable, instr, nargs, false, true);
+    }
+    else if (PyMethod_Check(callable)) {
+        PyObject *func = ((PyMethodObject *)callable)->im_func;
+        if (PyFunction_Check(func)) {
+            fail = specialize_py_call((PyFunctionObject *)func, instr, nargs, true, true);
+        }
+        else {
+            SPECIALIZATION_FAIL(ASYNC_CALL, SPEC_FAIL_CALL_BOUND_METHOD);
+            fail = -1;
+        }
+    }
+    else {
+        SPECIALIZATION_FAIL(ASYNC_CALL, SPEC_FAIL_CALL_NOT_COROUTINE);
+        fail = -1;
+    }
+    if (fail) {
+        unspecialize(instr);
+    }
+}
+
+void
+_Py_Specialize_AsyncCallKw(_PyStackRef callable_st, _Py_CODEUNIT *instr, int nargs)
+{
+    PyObject *callable = PyStackRef_AsPyObjectBorrow(callable_st);
+
+    assert(ENABLE_SPECIALIZATION);
+    assert(_PyOpcode_Caches[ASYNC_CALL_KW] == INLINE_CACHE_ENTRIES_ASYNC_CALL_KW);
+    assert(_Py_OPCODE(*instr) != INSTRUMENTED_ASYNC_CALL_KW);
+    int fail;
+    if (PyFunction_Check(callable)) {
+        fail = specialize_py_call_kw((PyFunctionObject *)callable, instr, nargs, false, true);
+    }
+    else if (PyMethod_Check(callable)) {
+        PyObject *func = ((PyMethodObject *)callable)->im_func;
+        if (PyFunction_Check(func)) {
+            fail = specialize_py_call_kw((PyFunctionObject *)func, instr, nargs, true, true);
+        }
+        else {
+            SPECIALIZATION_FAIL(ASYNC_CALL_KW, SPEC_FAIL_CALL_BOUND_METHOD);
+            fail = -1;
+        }
+    }
+    else {
+        SPECIALIZATION_FAIL(ASYNC_CALL_KW, SPEC_FAIL_CALL_NOT_COROUTINE);
+        fail = -1;
     }
     if (fail) {
         unspecialize(instr);

@@ -224,7 +224,8 @@ static int codegen_call_helper_impl(compiler *c, location loc,
                                     int n, /* Args already pushed */
                                     asdl_expr_seq *args,
                                     PyObject *injected_arg,
-                                    asdl_keyword_seq *keywords);
+                                    asdl_keyword_seq *keywords,
+                                    bool awaited);
 static int codegen_call_helper(compiler *c, location loc,
                                int n, asdl_expr_seq *args,
                                asdl_keyword_seq *keywords);
@@ -487,12 +488,12 @@ codegen_addop_j(instr_sequence *seq, location loc,
     RETURN_IF_ERROR(codegen_visit_unused_ ## TYPE((C), (V)))
 
 static int
-codegen_call_exit_with_nones(compiler *c, location loc)
+codegen_call_exit_with_nones(compiler *c, location loc, bool awaited)
 {
     ADDOP_LOAD_CONST(c, loc, Py_None);
     ADDOP_LOAD_CONST(c, loc, Py_None);
     ADDOP_LOAD_CONST(c, loc, Py_None);
-    ADDOP_I(c, loc, CALL, 3);
+    ADDOP_I(c, loc, awaited ? ASYNC_CALL : CALL, 3);
     return SUCCESS;
 }
 
@@ -615,8 +616,9 @@ codegen_unwind_fblock(compiler *c, location *ploc,
                 ADDOP_I(c, *ploc, SWAP, 3);
                 ADDOP_I(c, *ploc, SWAP, 2);
             }
-            RETURN_IF_ERROR(codegen_call_exit_with_nones(c, *ploc));
-            if (info->fb_type == COMPILE_FBLOCK_ASYNC_WITH) {
+            bool is_async = info->fb_type == COMPILE_FBLOCK_ASYNC_WITH;
+            RETURN_IF_ERROR(codegen_call_exit_with_nones(c, *ploc, is_async));
+            if (is_async) {
                 ADDOP_I(c, *ploc, GET_AWAITABLE, 2);
                 ADDOP(c, *ploc, PUSH_NULL);
                 ADDOP_LOAD_CONST(c, *ploc, Py_None);
@@ -1758,7 +1760,8 @@ codegen_class(compiler *c, stmt_ty s)
         RETURN_IF_ERROR_IN_SCOPE(c, codegen_call_helper_impl(c, loc, 2,
                                                              s->v.ClassDef.bases,
                                                              &_Py_STR(generic_base),
-                                                             s->v.ClassDef.keywords));
+                                                             s->v.ClassDef.keywords,
+                                                             false));
 
         PyCodeObject *co = _PyCompile_OptimizeAndAssemble(c, 0);
 
@@ -4152,7 +4155,7 @@ maybe_optimize_function_call(compiler *c, expr_ty e, jump_target_label end)
 
 // Return 1 if the method call was optimized, 0 if not, and -1 on error.
 static int
-maybe_optimize_method_call(compiler *c, expr_ty e)
+maybe_optimize_method_call(compiler *c, expr_ty e, bool awaited)
 {
     Py_ssize_t argsl, i, kwdsl;
     expr_ty meth = e->v.Call.func;
@@ -4217,11 +4220,11 @@ maybe_optimize_method_call(compiler *c, expr_ty e)
         RETURN_IF_ERROR(
             codegen_call_simple_kw_helper(c, loc, kwds, kwdsl));
         loc = update_start_location_to_match_attr(c, LOC(e), meth);
-        ADDOP_I(c, loc, CALL_KW, argsl + kwdsl);
+        ADDOP_I(c, loc, awaited ? ASYNC_CALL_KW : CALL_KW, argsl + kwdsl);
     }
     else {
         loc = update_start_location_to_match_attr(c, LOC(e), meth);
-        ADDOP_I(c, loc, CALL, argsl);
+        ADDOP_I(c, loc, awaited ? ASYNC_CALL : CALL, argsl);
     }
     return 1;
 }
@@ -4245,11 +4248,13 @@ codegen_validate_keywords(compiler *c, asdl_keyword_seq *keywords)
     return SUCCESS;
 }
 
+/* awaited: the result of the call is the operand of an await, as in
+ * `await f(...)`, so it is emitted as ASYNC_CALL or ASYNC_CALL_KW. */
 static int
-codegen_call(compiler *c, expr_ty e)
+codegen_call(compiler *c, expr_ty e, bool awaited)
 {
     RETURN_IF_ERROR(codegen_validate_keywords(c, e->v.Call.keywords));
-    int ret = maybe_optimize_method_call(c, e);
+    int ret = maybe_optimize_method_call(c, e, awaited);
     if (ret < 0) {
         return ERROR;
     }
@@ -4263,9 +4268,9 @@ codegen_call(compiler *c, expr_ty e)
     location loc = LOC(e->v.Call.func);
     ADDOP(c, loc, PUSH_NULL);
     loc = LOC(e);
-    ret = codegen_call_helper(c, loc, 0,
-                              e->v.Call.args,
-                              e->v.Call.keywords);
+    ret = codegen_call_helper_impl(c, loc, 0,
+                                   e->v.Call.args, NULL,
+                                   e->v.Call.keywords, awaited);
     USE_LABEL(c, skip_normal_call);
     return ret;
 }
@@ -4458,7 +4463,8 @@ codegen_call_helper_impl(compiler *c, location loc,
                          int n, /* Args already pushed */
                          asdl_expr_seq *args,
                          PyObject *injected_arg,
-                         asdl_keyword_seq *keywords)
+                         asdl_keyword_seq *keywords,
+                         bool awaited)
 {
     Py_ssize_t i, nseen, nelts, nkwelts;
 
@@ -4497,10 +4503,10 @@ codegen_call_helper_impl(compiler *c, location loc,
         VISIT_SEQ(c, keyword, keywords);
         RETURN_IF_ERROR(
             codegen_call_simple_kw_helper(c, loc, keywords, nkwelts));
-        ADDOP_I(c, loc, CALL_KW, n + nelts + nkwelts);
+        ADDOP_I(c, loc, awaited ? ASYNC_CALL_KW : CALL_KW, n + nelts + nkwelts);
     }
     else {
-        ADDOP_I(c, loc, CALL, n + nelts);
+        ADDOP_I(c, loc, awaited ? ASYNC_CALL : CALL, n + nelts);
     }
     return SUCCESS;
 
@@ -4566,7 +4572,7 @@ codegen_call_helper(compiler *c, location loc,
                     asdl_expr_seq *args,
                     asdl_keyword_seq *keywords)
 {
-    return codegen_call_helper_impl(c, loc, n, args, NULL, keywords);
+    return codegen_call_helper_impl(c, loc, n, args, NULL, keywords, false);
 }
 
 /* List and set comprehensions work by being inlined at the location where
@@ -5163,9 +5169,10 @@ codegen_comprehension(compiler *c, expr_ty e, int type,
     Py_CLEAR(co);
 
     VISIT(c, expr, outermost->iter);
-    ADDOP_I(c, loc, CALL, 0);
+    bool awaited = is_async_comprehension && type != COMP_GENEXP;
+    ADDOP_I(c, loc, awaited ? ASYNC_CALL : CALL, 0);
 
-    if (is_async_comprehension && type != COMP_GENEXP) {
+    if (awaited) {
         ADDOP_I(c, loc, GET_AWAITABLE, 0);
         ADDOP(c, loc, PUSH_NULL);
         ADDOP_LOAD_CONST(c, loc, Py_None);
@@ -5310,7 +5317,7 @@ codegen_async_with_inner(compiler *c, stmt_ty s, int pos)
     ADDOP_I(c, loc, SWAP, 2);
     ADDOP_I(c, loc, SWAP, 3);
     ADDOP_I(c, loc, LOAD_SPECIAL, SPECIAL___AENTER__);
-    ADDOP_I(c, loc, CALL, 0);
+    ADDOP_I(c, loc, ASYNC_CALL, 0);
     ADDOP_I(c, loc, GET_AWAITABLE, 1);
     ADDOP(c, loc, PUSH_NULL);
     ADDOP_LOAD_CONST(c, loc, Py_None);
@@ -5347,7 +5354,7 @@ codegen_async_with_inner(compiler *c, stmt_ty s, int pos)
     /* For successful outcome:
      * call __exit__(None, None, None)
      */
-    RETURN_IF_ERROR(codegen_call_exit_with_nones(c, loc));
+    RETURN_IF_ERROR(codegen_call_exit_with_nones(c, loc, true));
     ADDOP_I(c, loc, GET_AWAITABLE, 2);
     ADDOP(c, loc, PUSH_NULL);
     ADDOP_LOAD_CONST(c, loc, Py_None);
@@ -5454,7 +5461,7 @@ codegen_with_inner(compiler *c, stmt_ty s, int pos)
     /* For successful outcome:
      * call __exit__(None, None, None)
      */
-    RETURN_IF_ERROR(codegen_call_exit_with_nones(c, loc));
+    RETURN_IF_ERROR(codegen_call_exit_with_nones(c, loc, false));
     ADDOP(c, loc, POP_TOP);
     ADDOP_JUMP(c, loc, JUMP, exit);
 
@@ -5550,7 +5557,12 @@ codegen_visit_expr_impl(compiler *c, expr_ty e, bool result_is_unused)
         ADD_YIELD_FROM(c, loc, 0);
         break;
     case Await_kind:
-        VISIT(c, expr, e->v.Await.value);
+        if (e->v.Await.value->kind == Call_kind) {
+            RETURN_IF_ERROR(codegen_call(c, e->v.Await.value, true));
+        }
+        else {
+            VISIT(c, expr, e->v.Await.value);
+        }
         ADDOP_I(c, loc, GET_AWAITABLE, 0);
         ADDOP(c, loc, PUSH_NULL);
         ADDOP_LOAD_CONST(c, loc, Py_None);
@@ -5559,7 +5571,7 @@ codegen_visit_expr_impl(compiler *c, expr_ty e, bool result_is_unused)
     case Compare_kind:
         return codegen_compare(c, e);
     case Call_kind:
-        return codegen_call(c, e);
+        return codegen_call(c, e, false);
     case Constant_kind:
         ADDOP_LOAD_CONST(c, loc, e->v.Constant.value);
         break;

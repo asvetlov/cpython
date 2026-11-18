@@ -9,6 +9,8 @@ extern "C" {
 #endif
 
 #include "pycore_backoff.h"     // _Py_BackoffCounter
+#include "pycore_opcode_utils.h"  // CONSTANT_NONE
+#include "opcode_ids.h"           // GET_AWAITABLE
 #include "pycore_structs.h"     // _Py_CODEUNIT
 #include "pycore_tstate.h"      // _PyThreadStateImpl
 
@@ -128,6 +130,8 @@ typedef struct {
 
 #define INLINE_CACHE_ENTRIES_CALL CACHE_ENTRIES(_PyCallCache)
 #define INLINE_CACHE_ENTRIES_CALL_KW CACHE_ENTRIES(_PyCallCache)
+#define INLINE_CACHE_ENTRIES_ASYNC_CALL CACHE_ENTRIES(_PyCallCache)
+#define INLINE_CACHE_ENTRIES_ASYNC_CALL_KW CACHE_ENTRIES(_PyCallCache)
 
 typedef struct {
     _Py_BackoffCounter counter;
@@ -317,6 +321,10 @@ PyAPI_FUNC(void) _Py_Specialize_Call(_PyStackRef callable, _PyStackRef self_or_n
                                 _Py_CODEUNIT *instr, int nargs);
 PyAPI_FUNC(void) _Py_Specialize_CallKw(_PyStackRef callable, _Py_CODEUNIT *instr,
                                   int nargs);
+PyAPI_FUNC(void) _Py_Specialize_AsyncCall(_PyStackRef callable, _Py_CODEUNIT *instr,
+                                     int nargs);
+PyAPI_FUNC(void) _Py_Specialize_AsyncCallKw(_PyStackRef callable, _Py_CODEUNIT *instr,
+                                       int nargs);
 PyAPI_FUNC(void) _Py_Specialize_BinaryOp(_PyStackRef lhs, _PyStackRef rhs, _Py_CODEUNIT *instr,
                                     int oparg, _PyStackRef *locals);
 PyAPI_FUNC(void) _Py_Specialize_CompareOp(_PyStackRef lhs, _PyStackRef rhs,
@@ -541,6 +549,26 @@ PyAPI_FUNC(int) _Py_Instrument(PyCodeObject *co, PyInterpreterState *interp);
 
 // Export for '_testinternalcapi' shared extension
 PyAPI_FUNC(_Py_CODEUNIT) _Py_GetBaseCodeUnit(PyCodeObject *code, int offset);
+
+PyAPI_DATA(const uint8_t) _PyOpcode_Deopt[256];
+
+/* The SEND that awaits the result of the ASYNC_CALL or ASYNC_CALL_KW whose
+ * cache ends at `tail`, or NULL if the instructions after the call are not
+ * the ones the compiler emits for an await. */
+static inline _Py_CODEUNIT *
+_PyCode_AwaitedCallSend(_Py_CODEUNIT *tail)
+{
+    /* None of the first three instructions can end the code. */
+    if (tail[0].op.code == GET_AWAITABLE
+        && tail[1].op.code == PUSH_NULL
+        && tail[2].op.code == LOAD_COMMON_CONSTANT
+        && tail[2].op.arg == CONSTANT_NONE
+        && _PyOpcode_Deopt[tail[3].op.code] == SEND)
+    {
+        return &tail[3];
+    }
+    return NULL;
+}
 
 extern int _PyInstruction_GetLength(PyCodeObject *code, int offset);
 

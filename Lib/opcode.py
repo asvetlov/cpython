@@ -97,6 +97,14 @@ _cache_format = frozendict(
         counter=1,
         func_version=2,
     ),
+    ASYNC_CALL=frozendict(
+        counter=1,
+        func_version=2,
+    ),
+    ASYNC_CALL_KW=frozendict(
+        counter=1,
+        func_version=2,
+    ),
     CALL_FUNCTION_EX=frozendict(
         counter=1,
     ),

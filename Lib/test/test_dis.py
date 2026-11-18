@@ -613,7 +613,7 @@ dis_asyncwith = """\
                 SWAP                     2
                 SWAP                     3
                 LOAD_SPECIAL             2 (__aenter__)
-                CALL                     0
+                ASYNC_CALL               0
                 GET_AWAITABLE            1
                 PUSH_NULL
                 LOAD_COMMON_CONSTANT     7 (None)
@@ -630,7 +630,7 @@ dis_asyncwith = """\
 %4d    L7:     LOAD_COMMON_CONSTANT     7 (None)
                 LOAD_COMMON_CONSTANT     7 (None)
                 LOAD_COMMON_CONSTANT     7 (None)
-                CALL                     3
+                ASYNC_CALL               3
                 GET_AWAITABLE            2
                 PUSH_NULL
                 LOAD_COMMON_CONSTANT     7 (None)

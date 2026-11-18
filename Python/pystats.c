@@ -127,6 +127,8 @@ _Py_GetSpecializationStats(void) {
     err += add_stat_dict(src, stats, JUMP_BACKWARD, "jump_backward");
     err += add_stat_dict(src, stats, CALL, "call");
     err += add_stat_dict(src, stats, CALL_KW, "call_kw");
+    err += add_stat_dict(src, stats, ASYNC_CALL, "async_call");
+    err += add_stat_dict(src, stats, ASYNC_CALL_KW, "async_call_kw");
     err += add_stat_dict(src, stats, BINARY_OP, "binary_op");
     err += add_stat_dict(src, stats, COMPARE_OP, "compare_op");
     err += add_stat_dict(src, stats, UNPACK_SEQUENCE, "unpack_sequence");

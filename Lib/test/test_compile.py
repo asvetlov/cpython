@@ -1380,6 +1380,37 @@ class TestSpecifics(unittest.TestCase):
             self.assertIn('LOAD_SMALL_INT', instructions)
             self.assertIn(45, args)
 
+    def test_awaited_call_opcodes(self):
+        # A call whose result is awaited at once compiles to ASYNC_CALL or
+        # ASYNC_CALL_KW, always followed by the instructions of the await.
+        async def f(c, o, x):
+            await c(1)
+            await o.m(1)
+            await c(1, k=2)
+            await o.m(1, k=2)
+            async with o:
+                pass
+            await c(*x)
+            await x
+            c(1)
+            o.m(1, k=2)
+        tail = ['GET_AWAITABLE', 'PUSH_NULL', 'LOAD_COMMON_CONSTANT', 'SEND']
+        instrs = list(dis.get_instructions(f))
+        opnames = [i.opname for i in instrs]
+        awaited = [i for i, name in enumerate(opnames)
+                   if name in ('ASYNC_CALL', 'ASYNC_CALL_KW')]
+        for i in awaited:
+            self.assertEqual(opnames[i + 1:i + 5], tail, instrs[i])
+        self.assertEqual([opnames[i] for i in awaited],
+                         ['ASYNC_CALL', 'ASYNC_CALL', 'ASYNC_CALL_KW',
+                          'ASYNC_CALL_KW', 'ASYNC_CALL', 'ASYNC_CALL'])
+        self.assertEqual(opnames.count('CALL'), 1)
+        self.assertEqual(opnames.count('CALL_KW'), 1)
+        self.assertEqual(opnames.count('CALL_FUNCTION_EX'), 1)
+        for i, name in enumerate(opnames):
+            if name in ('CALL', 'CALL_KW'):
+                self.assertNotEqual(opnames[i + 1], 'GET_AWAITABLE', instrs[i])
+
     def test_lineno_procedure_call(self):
         def call():
             (

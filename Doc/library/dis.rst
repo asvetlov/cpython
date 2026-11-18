@@ -1630,6 +1630,24 @@ iterations of the loop.
    .. versionadded:: 3.13
 
 
+.. opcode:: ASYNC_CALL (argc)
+
+   Like :opcode:`CALL`, for a call whose result is awaited at once, as in
+   ``await f(...)``, ``async with`` and asynchronous comprehensions.
+   It is always followed by :opcode:`GET_AWAITABLE`, :opcode:`PUSH_NULL`,
+   :opcode:`LOAD_COMMON_CONSTANT` (``None``) and :opcode:`SEND`.
+
+   .. versionadded:: 3.16
+
+
+.. opcode:: ASYNC_CALL_KW (argc)
+
+   Like :opcode:`CALL_KW`, for a call whose result is awaited at once.
+   See :opcode:`ASYNC_CALL`.
+
+   .. versionadded:: 3.16
+
+
 .. opcode:: CALL_FUNCTION_EX (flags)
 
    Calls a callable object with variable set of positional and keyword
