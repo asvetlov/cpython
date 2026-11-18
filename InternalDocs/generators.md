@@ -116,7 +116,21 @@ the call with the first execution of the `GET_AWAITABLE`, `PUSH_NULL`,
 `LOAD_COMMON_CONSTANT` and `SEND` instructions that follow it.
 
 `ASYNC_CALL_*` create the frame with the micro-ops of the matching `CALL_*`
-or `CALL_KW_*` specialization. They then turn it into the frame of a new
-coroutine and push it at once, as `RETURN_GENERATOR` and `SEND_GEN` would do.
-The coroutine is not returned to the caller first and the frame of the caller
-is left as if it were executing the `SEND`.
+or `CALL_KW_*` specialization and push it at once, as a plain call would, but
+leave the frame of the caller as if `SEND_GEN` had pushed the frame of a
+coroutine: `None` and `NULL` on its stack and the instruction pointer at the
+`SEND`. The frame is marked `lazy_coro` and gets its own `_PyErr_StackItem`,
+pushed on the data stack right after it. In it, `RETURN_GENERATOR` only pushes
+the `None` that the following `POP_TOP` discards.
+
+No coroutine object exists yet. A body that returns or raises before it
+suspends never creates one: `RETURN_VALUE` lands in the caller at the
+`END_SEND`, and `clear_thread_frame()` pops the exception state. When the body
+reaches `YIELD_VALUE` for the first time, `_PyCoro_MaterializeLazy()` creates
+the coroutine, `_PyEval_MoveLazyCoroFrame()` moves the frame into it, and the
+`None` in the caller's stack is replaced by the coroutine, which is then
+suspended and resumed like any other.
+
+While coroutine origin tracking is on, the origin has to be recorded when the
+coroutine is created, so `ASYNC_CALL` is not specialized and the coroutine is
+created at once by `RETURN_GENERATOR`.

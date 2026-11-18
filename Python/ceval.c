@@ -1999,10 +1999,19 @@ fail_post_args:
     return -1;
 }
 
+static PyObject *pop_lazy_coro_exc_state(PyThreadState *, _PyInterpreterFrame *);
+
 static void
 clear_thread_frame(PyThreadState *tstate, _PyInterpreterFrame * frame)
 {
     assert(frame->owner == FRAME_OWNED_BY_THREAD);
+    PyObject *lazy_exc = NULL;
+    if (frame->lazy_coro) {
+        lazy_exc = pop_lazy_coro_exc_state(tstate, frame);
+        // Like clear_gen_frame(): a frame object that outlives the
+        // coroutine must not keep the caller's frame alive via f_back.
+        frame->previous = NULL;
+    }
     // Make sure that this is, indeed, the top frame. We can't check this in
     // _PyThreadState_PopFrame, since f_code is already cleared at that point:
     assert((PyObject **)frame + _PyFrame_GetCode(frame)->co_framesize ==
@@ -2011,6 +2020,7 @@ clear_thread_frame(PyThreadState *tstate, _PyInterpreterFrame * frame)
     _PyFrame_ClearExceptCode(frame);
     PyStackRef_CLEAR(frame->f_executable);
     _PyThreadState_PopFrame(tstate, frame);
+    Py_XDECREF(lazy_exc);
 }
 
 static void
@@ -3678,6 +3688,44 @@ _PyEval_LoadGlobalStackRef(PyObject *globals, PyObject *builtins, PyObject *name
         PyStackRef_CLOSE(writeto[0]);
         *writeto = l_v == NULL ? PyStackRef_NULL : PyStackRef_FromPyObjectSteal(l_v);
     }
+}
+
+/* Pop the exception state that _ASYNC_CALL_LAZY_FRAME gave a lazily
+ * started coroutine body, restoring the caller's. Returns the body's exception,
+ * if any (a new reference). */
+static PyObject *
+pop_lazy_coro_exc_state(PyThreadState *tstate, _PyInterpreterFrame *frame)
+{
+    assert(frame->lazy_coro);
+    _PyErr_StackItem *exc_info = tstate->exc_info;
+    tstate->exc_info = exc_info->previous_item;
+    PyObject *exc_value = exc_info->exc_value;
+    _PyThreadState_PopFrame(tstate, (_PyInterpreterFrame *)exc_info);
+    frame->lazy_coro = 0;
+    return exc_value;
+}
+
+/* YIELD_VALUE support: move the frame of a lazily created coroutine
+ * from the thread's data stack into `gen`. Returns the new frame. */
+_PyInterpreterFrame *
+_PyEval_MoveLazyCoroFrame(PyThreadState *tstate, PyGenObject *gen,
+                          _PyInterpreterFrame *frame)
+{
+    assert(frame->owner == FRAME_OWNED_BY_THREAD);
+    assert(frame->lazy_coro);
+    assert((PyObject **)frame + _PyFrame_GetCode(frame)->co_framesize ==
+           tstate->datastack_top);
+    _PyInterpreterFrame *gen_frame = &gen->gi_iframe;
+    _PyFrame_Copy(frame, gen_frame);
+    gen_frame->owner = FRAME_OWNED_BY_GENERATOR;
+    PyFrameObject *f = gen_frame->frame_obj;
+    if (f != NULL) {
+        Py_BEGIN_CRITICAL_SECTION(f);
+        f->f_frame = gen_frame;
+        Py_END_CRITICAL_SECTION();
+    }
+    _PyThreadState_PopFrame(tstate, frame);
+    return gen_frame;
 }
 
 PyObject *

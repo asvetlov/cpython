@@ -745,9 +745,8 @@ _PyJit_translate_single_bytecode_to_trace(
     }
 
     // RETURN_GENERATOR in a coroutine that ASYNC_CALL_* already started
-    // stays in its frame: it only pushes None (see _ASYNC_CALL_GEN_FRAME).
-    bool coro_running = opcode == RETURN_GENERATOR &&
-        frame == tracer->prev_state.instr_frame;
+    // stays in its frame: it only pushes None (see _ASYNC_CALL_LAZY_FRAME).
+    bool coro_running = opcode == RETURN_GENERATOR && frame->lazy_coro;
     bool needs_guard_ip = OPCODE_HAS_NEEDS_GUARD_IP(opcode) && !coro_running;
     if (has_dynamic_jump_taken && !needs_guard_ip) {
         DPRINTF(2, "Unsupported: dynamic jump taken %s\n", _PyOpcode_OpName[opcode]);

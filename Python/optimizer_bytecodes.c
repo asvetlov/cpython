@@ -1528,16 +1528,12 @@ dummy_func(void) {
         gen_frame = PyJitRef_WrapInvalid(new_frame);
     }
 
-    op(_GUARD_ASYNC_CALL_TAIL, (--)) {
-        // Only needed in tier 1: executors are invalidated
-        // when the code is instrumented.
-        ADD_OP(_NOP, 0, 0);
-    }
-
-    op(_ASYNC_CALL_GEN_FRAME, (new_frame -- coro, null, gen_frame)) {
-        coro = sym_new_type(ctx, &PyCoro_Type);
+    op(_ASYNC_CALL_LAZY_FRAME, (new_frame -- none, null, lazy_frame)) {
+        // The None is replaced by the coroutine when the body suspends,
+        // so it must not be treated as a constant.
+        none = sym_new_not_null(ctx);
         null = sym_new_null(ctx);
-        gen_frame = new_frame;
+        lazy_frame = new_frame;
     }
 
     op(_SEND_GEN_FRAME, (receiver, null, v -- receiver, null, gen_frame)) {

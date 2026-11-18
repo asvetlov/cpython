@@ -5063,23 +5063,22 @@
         }
 
         case _GUARD_ASYNC_CALL_TAIL: {
-            ADD_OP(_NOP, 0, 0);
             break;
         }
 
-        case _ASYNC_CALL_GEN_FRAME: {
+        case _ASYNC_CALL_LAZY_FRAME: {
             JitOptRef new_frame;
-            JitOptRef coro;
+            JitOptRef none;
             JitOptRef null;
-            JitOptRef gen_frame;
+            JitOptRef lazy_frame;
             new_frame = stack_pointer[-1];
-            coro = sym_new_type(ctx, &PyCoro_Type);
+            none = sym_new_not_null(ctx);
             null = sym_new_null(ctx);
-            gen_frame = new_frame;
+            lazy_frame = new_frame;
             CHECK_STACK_BOUNDS(2);
-            stack_pointer[-1] = coro;
+            stack_pointer[-1] = none;
             stack_pointer[0] = null;
-            stack_pointer[1] = gen_frame;
+            stack_pointer[1] = lazy_frame;
             stack_pointer += 2;
             ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
             break;

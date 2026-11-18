@@ -1754,14 +1754,19 @@ specialize_method_descriptor(PyMethodDescrObject *descr, PyObject *self_or_null,
 
 /* Can the ASYNC_CALL or ASYNC_CALL_KW at "instr", a call to a function
  * with the code "code", be specialized to one of the ASYNC_CALL_*
- * instructions? These start the new coroutine in place of the SEND that
- * awaits it. GET_AWAITABLE never fails for a new coroutine. */
+ * instructions? These start the body of the coroutine in place of the
+ * SEND that awaits it, without creating the coroutine object first.
+ * GET_AWAITABLE never fails for a new coroutine. Coroutine origin
+ * tracking needs the object at once (see _GUARD_ASYNC_CALL_TAIL). */
 static bool
 can_start_coroutine(PyCodeObject *code, _Py_CODEUNIT *instr)
 {
     int coro_flags = code->co_flags &
         (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR);
     if (coro_flags != CO_COROUTINE) {
+        return false;
+    }
+    if (_PyThreadState_GET()->coroutine_origin_tracking_depth != 0) {
         return false;
     }
     _Py_CODEUNIT *next = instr + 1 + _PyOpcode_Caches[_PyOpcode_Deopt[instr->op.code]];

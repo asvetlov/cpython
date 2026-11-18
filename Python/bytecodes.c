@@ -437,7 +437,11 @@ dummy_func(
 
         tier1 inst(INSTRUMENTED_END_SEND, (receiver, index_or_null, value -- val)) {
             PyObject *receiver_o = PyStackRef_AsPyObjectBorrow(receiver);
-            if (PyGen_Check(receiver_o) || PyCoro_CheckExact(receiver_o)) {
+            /* None is the placeholder of a lazily started coroutine that
+             * returned before it was created (see _ASYNC_CALL_LAZY_FRAME). */
+            if (PyGen_Check(receiver_o) || PyCoro_CheckExact(receiver_o) ||
+                Py_IsNone(receiver_o))
+            {
                 int err = monitor_stop_iteration(tstate, frame, this_instr, PyStackRef_AsPyObjectBorrow(value));
                 if (err) {
                     ERROR_NO_POP();
@@ -1850,9 +1854,29 @@ dummy_func(
             // NOTE: It's important that YIELD_VALUE never raises an exception!
             // The compiler treats any exception raised here as a failed close()
             // or throw() call.
+            // The one exception is a lazily created coroutine (see
+            // _ASYNC_CALL_LAZY_FRAME) that cannot be allocated: the await
+            // is then treated as having raised MemoryError.
             assert(frame->owner != FRAME_OWNED_BY_INTERPRETER);
+            PyGenObject *gen;
+            int lazy = frame->owner == FRAME_OWNED_BY_THREAD;
+            if (lazy) {
+                assert(frame->lazy_coro);
+                gen = (PyGenObject *)_PyCoro_MaterializeLazy(frame);
+                if (gen == NULL) {
+                    ERROR_NO_POP();
+                }
+                /* Move the body's exception state (see _ASYNC_CALL_LAZY_FRAME)
+                 * into the coroutine, where SEND_GEN would have put it. */
+                _PyErr_StackItem *exc_info = tstate->exc_info;
+                gen->gi_exc_state.exc_value = exc_info->exc_value;
+                gen->gi_exc_state.previous_item = exc_info->previous_item;
+                _PyThreadState_PopFrame(tstate, (_PyInterpreterFrame *)exc_info);
+            }
+            else {
+                gen = _PyGen_GetGeneratorFromFrame(frame);
+            }
             frame->instr_ptr++;
-            PyGenObject *gen = _PyGen_GetGeneratorFromFrame(frame);
             assert(FRAME_SUSPENDED_YIELD_FROM == FRAME_SUSPENDED + 1);
             assert(oparg == 0 || oparg == 1);
             _PyStackRef temp = retval;
@@ -1865,6 +1889,9 @@ dummy_func(
             _PyInterpreterFrame *gen_frame = frame;
             _PyThreadState_UpdateLastProfiledFrame(tstate, gen_frame, gen_frame->previous);
             frame = tstate->current_frame = frame->previous;
+            if (lazy) {
+                gen_frame = _PyEval_MoveLazyCoroFrame(tstate, gen, gen_frame);
+            }
             gen_frame->previous = NULL;
             ((_PyThreadStateImpl *)tstate)->generator_return_kind = GENERATOR_YIELD;
             FT_ATOMIC_STORE_INT8_RELEASE(gen->gi_frame_state, FRAME_SUSPENDED + oparg);
@@ -1880,6 +1907,12 @@ dummy_func(
             #endif
             RELOAD_STACK();
             LOAD_IP(1 + INLINE_CACHE_ENTRIES_SEND);
+            if (lazy) {
+                /* Fill in the coroutine slot of the caller's SEND. */
+                assert(PyStackRef_IsNone(stack_pointer[-2]));
+                assert(PyStackRef_IsNull(stack_pointer[-1]));
+                stack_pointer[-2] = PyStackRef_FromPyObjectStealMortal((PyObject *)gen);
+            }
             value = temp;
             LLTRACE_RESUME_FRAME();
         }
@@ -1959,9 +1992,9 @@ dummy_func(
 
         tier1 inst(CLEANUP_THROW, (sub_iter, null_in, last_sent_val, exc_value_st -- none, null_out, value)) {
             PyObject *exc_value = PyStackRef_AsPyObjectBorrow(exc_value_st);
-            #if !_Py_TAIL_CALL_INTERP
-            assert(throwflag);
-            #endif
+            /* Reached on throw()/close(), or when a lazily started
+             * coroutine could not be created at its first suspension
+             * (see _YIELD_VALUE). */
             assert(exc_value && PyExceptionInstance_Check(exc_value));
             int matches = PyErr_GivenExceptionMatches(exc_value, PyExc_StopIteration);
             if (matches) {
@@ -5346,10 +5379,11 @@ dummy_func(
         //     GET_AWAITABLE; PUSH_NULL; LOAD_COMMON_CONSTANT None; SEND
         // Unspecialized, it does the same as CALL. Its specializations, for
         // calls to coroutine functions, merge the call with the first
-        // execution of the instructions that follow it: the new coroutine is
-        // started without being returned to the caller first. They are built
-        // from the uops of the matching CALL_* specialization, with
-        // _ASYNC_CALL_GEN_FRAME in place of _SAVE_RETURN_OFFSET.
+        // execution of the instructions that follow it: the body of the
+        // coroutine is started in the frame of the call, and the coroutine
+        // object is only created if the body suspends. They are built from
+        // the uops of the matching CALL_* specialization, with
+        // _ASYNC_CALL_LAZY_FRAME in place of _SAVE_RETURN_OFFSET.
         family(ASYNC_CALL, INLINE_CACHE_ENTRIES_ASYNC_CALL) = {
             ASYNC_CALL_PY_EXACT_ARGS,
             ASYNC_CALL_BOUND_METHOD_EXACT_ARGS,
@@ -5377,48 +5411,53 @@ dummy_func(
         // none of them may be instrumented. Only the first and the last of
         // them can start a line.
         // Executors are invalidated when the code is instrumented.
+        // Coroutine origin tracking records the origin when the coroutine
+        // object is created, which the generic path does at once.
         op(_GUARD_ASYNC_CALL_TAIL, (--)) {
             #if TIER_ONE
             DEOPT_IF(next_instr[0].op.code >= MIN_INSTRUMENTED_OPCODE);
             DEOPT_IF(next_instr[3].op.code >= MIN_INSTRUMENTED_OPCODE);
             assert(_PyCode_AwaitedCallSend(next_instr) != NULL);
             #endif
+            DEOPT_IF(tstate->coroutine_origin_tracking_depth != 0);
         }
 
-        // Turns the frame of a call to a coroutine function into a running
-        // coroutine: the equivalent of executing RETURN_GENERATOR in that
+        // Starts the body of a call to a coroutine function in the frame
+        // that was just created for it, without creating the coroutine
+        // object: the equivalent of executing RETURN_GENERATOR in that
         // frame, followed by GET_AWAITABLE, PUSH_NULL, LOAD_COMMON_CONSTANT
-        // None and SEND_GEN in this one.
-        op(_ASYNC_CALL_GEN_FRAME, (new_frame -- coro, null, gen_frame)) {
+        // None and SEND_GEN in this one. The coroutine object is created
+        // when the body first suspends (see _YIELD_VALUE), so a body that
+        // returns or raises before that never needs one.
+        op(_ASYNC_CALL_LAZY_FRAME, (new_frame -- none, null, lazy_frame)) {
             _PyInterpreterFrame *callee = PyStackRef_Unwrap(new_frame);
             DEAD(new_frame);
             SYNC_SP();
-            assert(PyStackRef_FunctionCheck(callee->f_funcobj));
-            PyFunctionObject *func = (PyFunctionObject *)PyStackRef_AsPyObjectBorrow(callee->f_funcobj);
-            PyGenObject *gen = (PyGenObject *)_Py_MakeCoroWithFrame(func, callee);
-            if (gen == NULL) {
+            assert(callee->previous == frame);
+            // The body gets its own exception state, as SEND_GEN would
+            // give it. It lives on the data stack right after the frame;
+            // clear_thread_frame() and _YIELD_VALUE pop it.
+            _PyErr_StackItem *exc_info = (_PyErr_StackItem *)_PyThreadState_PushFrame(
+                tstate, sizeof(_PyErr_StackItem) / sizeof(PyObject *));
+            if (exc_info == NULL) {
                 _PyEval_FrameClearAndPop(tstate, callee);
                 ERROR_NO_POP();
             }
-            assert(Py_TYPE(gen) == &PyCoro_Type);
-            if (callee->instr_ptr->op.code == RETURN_GENERATOR) {
-                assert(callee->instr_ptr[1].op.code == POP_TOP);
-                callee->instr_ptr += 2;
-            }
-            // Otherwise RETURN_GENERATOR is preceded by COPY_FREE_VARS or
-            // MAKE_CELL. They run in the frame of the coroutine, where
-            // RETURN_GENERATOR only pushes the None that POP_TOP discards.
-            gen_take_frame(tstate, gen, callee, frame);
-            gen->gi_frame_state = FRAME_EXECUTING;
-            // The coroutine yields and returns to the SEND of the await.
+            exc_info->exc_value = NULL;
+            exc_info->previous_item = tstate->exc_info;
+            tstate->exc_info = exc_info;
+            callee->lazy_coro = 1;
+            // The body yields and returns to the SEND of the await, as if
+            // SEND_GEN had pushed its frame. None stands in for the
+            // coroutine on the stack until it is created.
             _Py_CODEUNIT *send = _PyCode_AwaitedCallSend(frame->instr_ptr + INSTRUCTION_SIZE);
             assert(send != NULL);
             frame->instr_ptr = send;
-            gen_link_frame(tstate, gen, frame,
-                (uint16_t)(1 + INLINE_CACHE_ENTRIES_SEND + send->op.arg));
-            coro = PyStackRef_FromPyObjectStealMortal((PyObject *)gen);
+            assert(1 + INLINE_CACHE_ENTRIES_SEND + send->op.arg <= UINT16_MAX);
+            frame->return_offset = (uint16_t)(1 + INLINE_CACHE_ENTRIES_SEND + send->op.arg);
+            none = PyStackRef_None;
             null = PyStackRef_NULL;
-            gen_frame = PyStackRef_Wrap(&gen->gi_iframe);
+            lazy_frame = PyStackRef_Wrap(callee);
         }
 
         macro(ASYNC_CALL_PY_EXACT_ARGS) =
@@ -5431,7 +5470,7 @@ dummy_func(
             _CHECK_STACK_SPACE +
             _CHECK_RECURSION_REMAINING +
             _INIT_CALL_PY_EXACT_ARGS +
-            _ASYNC_CALL_GEN_FRAME +
+            _ASYNC_CALL_LAZY_FRAME +
             _PUSH_FRAME;
 
         macro(ASYNC_CALL_BOUND_METHOD_EXACT_ARGS) =
@@ -5447,7 +5486,7 @@ dummy_func(
             _CHECK_STACK_SPACE +
             _CHECK_RECURSION_REMAINING +
             _INIT_CALL_PY_EXACT_ARGS +
-            _ASYNC_CALL_GEN_FRAME +
+            _ASYNC_CALL_LAZY_FRAME +
             _PUSH_FRAME;
 
         macro(ASYNC_CALL_PY_GENERAL) =
@@ -5458,7 +5497,7 @@ dummy_func(
             _CHECK_FUNCTION_VERSION +
             _CHECK_RECURSION_REMAINING +
             _PY_FRAME_GENERAL +
-            _ASYNC_CALL_GEN_FRAME +
+            _ASYNC_CALL_LAZY_FRAME +
             _PUSH_FRAME;
 
         macro(ASYNC_CALL_BOUND_METHOD_GENERAL) =
@@ -5471,7 +5510,7 @@ dummy_func(
             flush + // so that self is in the argument array
             _CHECK_RECURSION_REMAINING +
             _PY_FRAME_GENERAL +
-            _ASYNC_CALL_GEN_FRAME +
+            _ASYNC_CALL_LAZY_FRAME +
             _PUSH_FRAME;
 
         // Cache layout: counter/1, func_version/2
@@ -5711,7 +5750,7 @@ dummy_func(
             _CHECK_FUNCTION_VERSION_KW +
             _CHECK_RECURSION_REMAINING +
             _PY_FRAME_KW +
-            _ASYNC_CALL_GEN_FRAME +
+            _ASYNC_CALL_LAZY_FRAME +
             _PUSH_FRAME;
 
         macro(ASYNC_CALL_KW_BOUND_METHOD) =
@@ -5723,7 +5762,7 @@ dummy_func(
             _EXPAND_METHOD_KW +
             flush + // so that self is in the argument array
             _PY_FRAME_KW +
-            _ASYNC_CALL_GEN_FRAME +
+            _ASYNC_CALL_LAZY_FRAME +
             _PUSH_FRAME;
 
         op(_CHECK_IS_NOT_PY_CALLABLE_KW, (callable, unused, unused[oparg], unused -- callable, unused, unused[oparg], unused)) {
@@ -5988,8 +6027,10 @@ dummy_func(
         }
 
         inst(RETURN_GENERATOR, (-- res)) {
-            if (frame->owner == FRAME_OWNED_BY_GENERATOR) {
-                // Handled by ASYNC_CALL_* already.
+            if (frame->lazy_coro) {
+                // The body of a coroutine started by ASYNC_CALL_*: the
+                // coroutine is created when it first suspends, if ever
+                // (see _ASYNC_CALL_LAZY_FRAME).
                 res = PyStackRef_None;
             }
             else {

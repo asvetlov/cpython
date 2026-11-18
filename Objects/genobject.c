@@ -1104,9 +1104,8 @@ PyTypeObject PyGen_Type = {
 };
 
 static PyObject *
-make_gen(PyTypeObject *type, PyFunctionObject *func)
+make_gen(PyTypeObject *type, PyFunctionObject *func, PyCodeObject *code)
 {
-    PyCodeObject *code = (PyCodeObject *)func->func_code;
     int slots = _PyFrame_NumSlotsForCodeObject(code);
     PyGenObject *gen = PyObject_GC_NewVar(PyGenObject, type, slots);
     if (gen == NULL) {
@@ -1127,30 +1126,11 @@ make_gen(PyTypeObject *type, PyFunctionObject *func)
     return (PyObject *)gen;
 }
 
-PyObject *
-_Py_MakeCoroWithFrame(PyFunctionObject *func, _PyInterpreterFrame *frame)
+static PyObject *
+make_coro(PyFunctionObject *func, PyCodeObject *code,
+          _PyInterpreterFrame *caller)
 {
-    int coro_flags = ((PyCodeObject *)func->func_code)->co_flags &
-        (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR);
-    assert(coro_flags);
-    if (coro_flags == CO_GENERATOR) {
-        return make_gen(&PyGen_Type, func);
-    }
-    if (coro_flags == CO_ASYNC_GENERATOR) {
-        PyAsyncGenObject *ag;
-        ag = (PyAsyncGenObject *)make_gen(&PyAsyncGen_Type, func);
-        if (ag == NULL) {
-            return NULL;
-        }
-        ag->ag_origin_or_finalizer = NULL;
-        ag->ag_closed = 0;
-        ag->ag_hooks_inited = 0;
-        ag->ag_running_async = 0;
-        return (PyObject*)ag;
-    }
-
-    assert (coro_flags == CO_COROUTINE);
-    PyObject *coro = make_gen(&PyCoro_Type, func);
+    PyObject *coro = make_gen(&PyCoro_Type, func, code);
     if (!coro) {
         return NULL;
     }
@@ -1160,9 +1140,7 @@ _Py_MakeCoroWithFrame(PyFunctionObject *func, _PyInterpreterFrame *frame)
     if (origin_depth == 0) {
         ((PyCoroObject *)coro)->cr_origin_or_finalizer = NULL;
     } else {
-        assert(frame);
-        assert(_PyFrame_IsIncomplete(frame));
-        frame = _PyFrame_GetFirstComplete(frame->previous);
+        _PyInterpreterFrame *frame = _PyFrame_GetFirstComplete(caller);
         PyObject *cr_origin = _PyCoro_ComputeOrigin(origin_depth, frame);
         ((PyCoroObject *)coro)->cr_origin_or_finalizer = cr_origin;
         if (!cr_origin) {
@@ -1176,7 +1154,53 @@ _Py_MakeCoroWithFrame(PyFunctionObject *func, _PyInterpreterFrame *frame)
 PyObject *
 _Py_MakeCoro(PyFunctionObject *func)
 {
-    return _Py_MakeCoroWithFrame(func, _PyThreadState_GET()->current_frame);
+    PyCodeObject *code = (PyCodeObject *)func->func_code;
+    int coro_flags = code->co_flags &
+        (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR);
+    assert(coro_flags);
+    if (coro_flags == CO_GENERATOR) {
+        return make_gen(&PyGen_Type, func, code);
+    }
+    if (coro_flags == CO_ASYNC_GENERATOR) {
+        PyAsyncGenObject *ag;
+        ag = (PyAsyncGenObject *)make_gen(&PyAsyncGen_Type, func, code);
+        if (ag == NULL) {
+            return NULL;
+        }
+        ag->ag_origin_or_finalizer = NULL;
+        ag->ag_closed = 0;
+        ag->ag_hooks_inited = 0;
+        ag->ag_running_async = 0;
+        return (PyObject*)ag;
+    }
+
+    assert (coro_flags == CO_COROUTINE);
+    PyThreadState *tstate = _PyThreadState_GET();
+    _PyInterpreterFrame *frame = tstate->current_frame;
+    assert(frame);
+    assert(_PyFrame_IsIncomplete(frame));
+    return make_coro(func, code, frame->previous);
+}
+
+/* Create the coroutine object for a coroutine whose body has been
+ * executing directly in `frame`, a frame owned by the thread, because
+ * its caller awaited the result immediately (see _ASYNC_CALL_LAZY_FRAME
+ * in bytecodes.c).  Called when the body suspends for the first time.
+ * The frame itself is moved into the coroutine by the caller.
+ * The body may have replaced func.__code__ in the meantime, so the
+ * coroutine is sized for the code the frame is actually running. */
+PyObject *
+_PyCoro_MaterializeLazy(_PyInterpreterFrame *frame)
+{
+    assert(frame->owner == FRAME_OWNED_BY_THREAD);
+    assert(frame->lazy_coro);
+    assert(PyStackRef_FunctionCheck(frame->f_funcobj));
+    PyFunctionObject *func =
+        (PyFunctionObject *)PyStackRef_AsPyObjectBorrow(frame->f_funcobj);
+    PyCodeObject *code = _PyFrame_GetCode(frame);
+    assert((code->co_flags &
+            (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)) == CO_COROUTINE);
+    return make_coro(func, code, frame->previous);
 }
 
 static PyObject *

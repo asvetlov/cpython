@@ -1816,6 +1816,41 @@ class TestSpecializer(TestBase):
 
     @cpython_only
     @requires_specialization
+    def test_async_call_origin_tracking(self):
+        # The origin of a coroutine is recorded when its object is
+        # created, so a call that is awaited at once keeps creating it
+        # while origin tracking is on.
+        def run_async(coro):
+            try:
+                coro.send(None)
+            except StopIteration as ex:
+                return ex.value
+            self.fail("coroutine did not finish")
+
+        async def coro(a):
+            return sys._getframe().f_generator
+
+        async def caller(n):
+            return [await coro(i) for i in range(n)]
+
+        orig_depth = sys.get_coroutine_origin_tracking_depth()
+        self.addCleanup(sys.set_coroutine_origin_tracking_depth, orig_depth)
+        n = _testinternalcapi.SPECIALIZATION_THRESHOLD
+        sys.set_coroutine_origin_tracking_depth(1)
+        self.assertNotIn(None, run_async(caller(n)))
+        self.assert_no_opcode(caller, "ASYNC_CALL_PY_EXACT_ARGS")
+
+        sys.set_coroutine_origin_tracking_depth(0)
+        n = _testinternalcapi.SPECIALIZATION_COOLDOWN
+        self.assertIn(None, run_async(caller(n)))
+        self.assert_specialized(caller, "ASYNC_CALL_PY_EXACT_ARGS")
+
+        # Turned on again, the specialized instruction deoptimizes.
+        sys.set_coroutine_origin_tracking_depth(1)
+        self.assertNotIn(None, run_async(caller(n)))
+
+    @cpython_only
+    @requires_specialization
     def test_async_call_deopt(self):
         def run_async(coro):
             try:

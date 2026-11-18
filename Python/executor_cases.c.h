@@ -9612,11 +9612,39 @@
             oparg = CURRENT_OPARG();
             retval = _stack_item_0;
             assert(frame->owner != FRAME_OWNED_BY_INTERPRETER);
+            PyGenObject *gen;
+            int lazy = frame->owner == FRAME_OWNED_BY_THREAD;
+            if (lazy) {
+                assert(frame->lazy_coro);
+                stack_pointer[0] = retval;
+                stack_pointer += 1;
+                ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+                _PyFrame_SetStackPointer(frame, stack_pointer);
+                _PyFrame_StackPointerValidate(frame);
+                gen = (PyGenObject *)_PyCoro_MaterializeLazy(frame);
+                _PyFrame_StackPointerInvalidate(frame);
+                if (gen == NULL) {
+                    SET_CURRENT_CACHED_VALUES(0);
+                    JUMP_TO_ERROR();
+                }
+                _PyErr_StackItem *exc_info = tstate->exc_info;
+                gen->gi_exc_state.exc_value = exc_info->exc_value;
+                gen->gi_exc_state.previous_item = exc_info->previous_item;
+                assert(stack_pointer == _PyFrame_GetStackPointer(frame));
+                _PyFrame_StackPointerValidate(frame);
+                _PyThreadState_PopFrame(tstate, (_PyInterpreterFrame *)exc_info);
+                _PyFrame_StackPointerInvalidate(frame);
+            }
+            else {
+                gen = _PyGen_GetGeneratorFromFrame(frame);
+                stack_pointer += 1;
+            }
             frame->instr_ptr++;
-            PyGenObject *gen = _PyGen_GetGeneratorFromFrame(frame);
             assert(FRAME_SUSPENDED_YIELD_FROM == FRAME_SUSPENDED + 1);
             assert(oparg == 0 || oparg == 1);
             _PyStackRef temp = retval;
+            stack_pointer += -1;
+            ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
             _PyFrame_SetStackPointer(frame, stack_pointer);
             _PyFrame_StackPointerValidate(frame);
             DTRACE_FUNCTION_RETURN();
@@ -9626,6 +9654,9 @@
             _PyInterpreterFrame *gen_frame = frame;
             _PyThreadState_UpdateLastProfiledFrame(tstate, gen_frame, gen_frame->previous);
             frame = tstate->current_frame = frame->previous;
+            if (lazy) {
+                gen_frame = _PyEval_MoveLazyCoroFrame(tstate, gen, gen_frame);
+            }
             gen_frame->previous = NULL;
             ((_PyThreadStateImpl *)tstate)->generator_return_kind = GENERATOR_YIELD;
             FT_ATOMIC_STORE_INT8_RELEASE(gen->gi_frame_state, FRAME_SUSPENDED + oparg);
@@ -9641,6 +9672,11 @@
             stack_pointer = _PyFrame_GetStackPointer(frame);
             _PyFrame_StackPointerInvalidate(frame);
             LOAD_IP(1 + INLINE_CACHE_ENTRIES_SEND);
+            if (lazy) {
+                assert(PyStackRef_IsNone(stack_pointer[-2]));
+                assert(PyStackRef_IsNull(stack_pointer[-1]));
+                stack_pointer[-2] = PyStackRef_FromPyObjectStealMortal((PyObject *)gen);
+            }
             value = temp;
             LLTRACE_RESUME_FRAME();
             _tos_cache0 = value;
@@ -20039,6 +20075,11 @@
             }
             assert(_PyCode_AwaitedCallSend(next_instr) != NULL);
             #endif
+            if (tstate->coroutine_origin_tracking_depth != 0) {
+                UOP_STAT_INC(uopcode, miss);
+                SET_CURRENT_CACHED_VALUES(0);
+                JUMP_TO_JUMP_TARGET();
+            }
             SET_CURRENT_CACHED_VALUES(0);
             ASSERT_WITHIN_STACK_BOUNDS_IGNORING_CACHE(__FILE__, __LINE__);
             break;
@@ -20063,6 +20104,12 @@
             }
             assert(_PyCode_AwaitedCallSend(next_instr) != NULL);
             #endif
+            if (tstate->coroutine_origin_tracking_depth != 0) {
+                UOP_STAT_INC(uopcode, miss);
+                _tos_cache0 = _stack_item_0;
+                SET_CURRENT_CACHED_VALUES(1);
+                JUMP_TO_JUMP_TARGET();
+            }
             _tos_cache0 = _stack_item_0;
             SET_CURRENT_CACHED_VALUES(1);
             ASSERT_WITHIN_STACK_BOUNDS_IGNORING_CACHE(__FILE__, __LINE__);
@@ -20091,6 +20138,13 @@
             }
             assert(_PyCode_AwaitedCallSend(next_instr) != NULL);
             #endif
+            if (tstate->coroutine_origin_tracking_depth != 0) {
+                UOP_STAT_INC(uopcode, miss);
+                _tos_cache1 = _stack_item_1;
+                _tos_cache0 = _stack_item_0;
+                SET_CURRENT_CACHED_VALUES(2);
+                JUMP_TO_JUMP_TARGET();
+            }
             _tos_cache1 = _stack_item_1;
             _tos_cache0 = _stack_item_0;
             SET_CURRENT_CACHED_VALUES(2);
@@ -20123,6 +20177,14 @@
             }
             assert(_PyCode_AwaitedCallSend(next_instr) != NULL);
             #endif
+            if (tstate->coroutine_origin_tracking_depth != 0) {
+                UOP_STAT_INC(uopcode, miss);
+                _tos_cache2 = _stack_item_2;
+                _tos_cache1 = _stack_item_1;
+                _tos_cache0 = _stack_item_0;
+                SET_CURRENT_CACHED_VALUES(3);
+                JUMP_TO_JUMP_TARGET();
+            }
             _tos_cache2 = _stack_item_2;
             _tos_cache1 = _stack_item_1;
             _tos_cache0 = _stack_item_0;
@@ -20131,23 +20193,23 @@
             break;
         }
 
-        case _ASYNC_CALL_GEN_FRAME_r13: {
+        case _ASYNC_CALL_LAZY_FRAME_r13: {
             CHECK_CURRENT_CACHED_VALUES(1);
             ASSERT_WITHIN_STACK_BOUNDS_IGNORING_CACHE(__FILE__, __LINE__);
             _PyStackRef new_frame;
-            _PyStackRef coro;
+            _PyStackRef none;
             _PyStackRef null;
-            _PyStackRef gen_frame;
+            _PyStackRef lazy_frame;
             _PyStackRef _stack_item_0 = _tos_cache0;
             new_frame = _stack_item_0;
             _PyInterpreterFrame *callee = PyStackRef_Unwrap(new_frame);
-            assert(PyStackRef_FunctionCheck(callee->f_funcobj));
-            PyFunctionObject *func = (PyFunctionObject *)PyStackRef_AsPyObjectBorrow(callee->f_funcobj);
+            assert(callee->previous == frame);
             _PyFrame_SetStackPointer(frame, stack_pointer);
             _PyFrame_StackPointerValidate(frame);
-            PyGenObject *gen = (PyGenObject *)_Py_MakeCoroWithFrame(func, callee);
+            _PyErr_StackItem *exc_info = (_PyErr_StackItem *)_PyThreadState_PushFrame(
+                tstate, sizeof(_PyErr_StackItem) / sizeof(PyObject *));
             _PyFrame_StackPointerInvalidate(frame);
-            if (gen == NULL) {
+            if (exc_info == NULL) {
                 assert(stack_pointer == _PyFrame_GetStackPointer(frame));
                 _PyFrame_StackPointerValidate(frame);
                 _PyEval_FrameClearAndPop(tstate, callee);
@@ -20155,24 +20217,21 @@
                 SET_CURRENT_CACHED_VALUES(0);
                 JUMP_TO_ERROR();
             }
-            assert(Py_TYPE(gen) == &PyCoro_Type);
-            if (callee->instr_ptr->op.code == RETURN_GENERATOR) {
-                assert(callee->instr_ptr[1].op.code == POP_TOP);
-                callee->instr_ptr += 2;
-            }
-            gen_take_frame(tstate, gen, callee, frame);
-            gen->gi_frame_state = FRAME_EXECUTING;
+            exc_info->exc_value = NULL;
+            exc_info->previous_item = tstate->exc_info;
+            tstate->exc_info = exc_info;
+            callee->lazy_coro = 1;
             _Py_CODEUNIT *send = _PyCode_AwaitedCallSend(frame->instr_ptr + 4u );
             assert(send != NULL);
             frame->instr_ptr = send;
-            gen_link_frame(tstate, gen, frame,
-                           (uint16_t)(1 + INLINE_CACHE_ENTRIES_SEND + send->op.arg));
-            coro = PyStackRef_FromPyObjectStealMortal((PyObject *)gen);
+            assert(1 + INLINE_CACHE_ENTRIES_SEND + send->op.arg <= UINT16_MAX);
+            frame->return_offset = (uint16_t)(1 + INLINE_CACHE_ENTRIES_SEND + send->op.arg);
+            none = PyStackRef_None;
             null = PyStackRef_NULL;
-            gen_frame = PyStackRef_Wrap(&gen->gi_iframe);
-            _tos_cache2 = gen_frame;
+            lazy_frame = PyStackRef_Wrap(callee);
+            _tos_cache2 = lazy_frame;
             _tos_cache1 = null;
-            _tos_cache0 = coro;
+            _tos_cache0 = none;
             SET_CURRENT_CACHED_VALUES(3);
             ASSERT_WITHIN_STACK_BOUNDS_IGNORING_CACHE(__FILE__, __LINE__);
             break;
@@ -20978,7 +21037,7 @@
             CHECK_CURRENT_CACHED_VALUES(0);
             ASSERT_WITHIN_STACK_BOUNDS_IGNORING_CACHE(__FILE__, __LINE__);
             _PyStackRef res;
-            if (frame->owner == FRAME_OWNED_BY_GENERATOR) {
+            if (frame->lazy_coro) {
                 res = PyStackRef_None;
             }
             else {

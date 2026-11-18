@@ -5935,30 +5935,53 @@ class TestUopsOptimization(unittest.TestCase):
                     return total
             """), ns)
             return ns["outer"]
+        class Suspend:
+            def __await__(self):
+                yield
+        # Not `await Suspend()`: a call to a class is an ASYNC_CALL that
+        # is never specialized, which would end the trace.
+        suspend = Suspend()
+        async def suspending(i):
+            await suspend
+            return i + 1
         def run(coro):
-            try:
-                coro.send(None)
-            except StopIteration as ex:
-                return ex.value
+            yields = 0
+            while True:
+                try:
+                    coro.send(None)
+                except StopIteration as ex:
+                    return ex.value, yields
+                yields += 1
+        def drive(coro):
+            # A loop in C: a trace of a Python driver loop would block
+            # tracing outer() while it is being recorded.
+            return len(list(iter(lambda: coro.send(None), object())))
 
         n = TIER2_THRESHOLD * 2
-        for callee in inner, make_closure(1):
+        for callee in inner, make_closure(1), suspending:
             with self.subTest(callee=callee):
                 outer = make_outer(callee)
-                self.assertEqual(run(outer(n)), sum(range(1, n + 1)))
+                yields = n if callee is suspending else 0
+                self.assertEqual(run(outer(n)), (sum(range(1, n + 1)), yields))
+                if callee is suspending:
+                    outer = make_outer(callee)
+                    self.assertEqual(drive(outer(n)), n)
                 ex = get_first_executor(outer)
                 self.assertIsNotNone(ex)
                 uops = get_opnames(ex)
 
-                # The coroutine is started without being returned to outer()
-                # first, and runs to its return within the trace.
-                self.assertIn("_ASYNC_CALL_GEN_FRAME", uops)
+                # The body of the coroutine is started without a coroutine
+                # object, in the trace.
+                self.assertIn("_ASYNC_CALL_LAZY_FRAME", uops)
                 self.assertNotIn("_RETURN_GENERATOR", uops)
-                self.assertNotIn("_SEND_GEN_FRAME", uops)
-                self.assertIn("_RETURN_VALUE", uops)
-                self.assertIn("_END_SEND", uops)
-                # The guard is only needed in tier 1.
-                self.assertNotIn("_GUARD_ASYNC_CALL_TAIL", uops)
+                if callee is suspending:
+                    # The coroutine is created at the suspension, which
+                    # the trace reaches through the awaited generator.
+                    self.assertIn("_YIELD_VALUE", uops)
+                else:
+                    self.assertNotIn("_SEND_GEN_FRAME", uops)
+                    self.assertIn("_RETURN_VALUE", uops)
+                    self.assertIn("_END_SEND", uops)
 
     def test_send_virtual(self):
 
